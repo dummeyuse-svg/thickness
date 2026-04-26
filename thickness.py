@@ -1,0 +1,618 @@
+#!/usr/bin/env python3
+"""
+PCB Warpage / Uplift Detection System
+Mode: Manual capture + file upload support + interactive ROI selector
+"""
+
+import cv2
+import numpy as np
+import time
+import os
+import json
+from datetime import datetime
+from tkinter import Tk, filedialog
+
+# Picamera2 is only available on Raspberry Pi — import safely
+try:
+    from picamera2 import Picamera2
+    CAMERA_AVAILABLE = True
+except ImportError:
+    CAMERA_AVAILABLE = False
+    print("[WARN] picamera2 not found — camera options disabled. File mode only.")
+
+# ──────────────────────────────────────────────
+# CONFIGURATION
+# ──────────────────────────────────────────────
+CONFIG = {
+    # Camera
+    "CAPTURE_RESOLUTION": (2304, 1296),
+    "LENS_POSITION": 2.0,
+    "EXPOSURE_TIME": 5000,
+
+    # All images (camera or file) are resized to this width before processing.
+    # This ensures baseline and inspection images are always the same scale.
+    "TARGET_WIDTH": 2000,
+
+    # ROI — set interactively via option 4, saved to roi_config.json
+    "ROI_Y_START": 600,
+    "ROI_Y_END":   900,
+    "ROI_X_START": 100,
+    "ROI_X_END":   1900,
+
+    # Detection thresholds
+    "UPLIFT_THRESHOLD_PX": 5,     # Flag a column if |uplift| > this (px)
+    "MIN_FAIL_COLUMNS":    10,    # Min contiguous flagged columns to raise FAIL
+    "MAX_MM_THRESHOLD":    0.3,   # FAIL immediately if any point exceeds this (mm)
+
+    # Files
+    "BASELINE_FILE":   "baseline.json",
+    "ROI_CONFIG_FILE": "roi_config.json",
+    "LOG_DIR":         "inspection_logs",
+
+    # Edge detection
+    "BLUR_KERNEL": 5,
+    "CANNY_LOW":   30,
+    "CANNY_HIGH":  100,
+
+    # Physical calibration — measure with ruler after setup
+    # At ~17cm with standard lens at TARGET_WIDTH=2000: approx 10 px/mm
+    "PX_PER_MM": 10.0,
+}
+
+# ──────────────────────────────────────────────
+# FILE PICKER (GUI dialog)
+# ──────────────────────────────────────────────
+def pick_image_file(title="Select Image"):
+    """Opens a file picker dialog. Returns path or empty string if cancelled."""
+    root = Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    path = filedialog.askopenfilename(
+        title=title,
+        filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp")]
+    )
+    root.destroy()
+    return path
+
+# ──────────────────────────────────────────────
+# ROI CONFIG — load/save
+# ──────────────────────────────────────────────
+def load_roi_config():
+    if os.path.exists(CONFIG["ROI_CONFIG_FILE"]):
+        with open(CONFIG["ROI_CONFIG_FILE"]) as f:
+            roi = json.load(f)
+        # Only update ROI keys, not entire CONFIG
+        for key in ("ROI_X_START", "ROI_X_END", "ROI_Y_START", "ROI_Y_END"):
+            if key in roi:
+                CONFIG[key] = roi[key]
+        print(f"[ROI] Loaded: "
+              f"X={CONFIG['ROI_X_START']}–{CONFIG['ROI_X_END']}, "
+              f"Y={CONFIG['ROI_Y_START']}–{CONFIG['ROI_Y_END']}")
+    else:
+        print("[ROI] No roi_config.json found — using defaults. Run option 4 to set ROI.")
+
+def save_roi_config():
+    roi = {
+        "ROI_X_START": CONFIG["ROI_X_START"],
+        "ROI_X_END":   CONFIG["ROI_X_END"],
+        "ROI_Y_START": CONFIG["ROI_Y_START"],
+        "ROI_Y_END":   CONFIG["ROI_Y_END"],
+    }
+    with open(CONFIG["ROI_CONFIG_FILE"], "w") as f:
+        json.dump(roi, f, indent=2)
+
+# ──────────────────────────────────────────────
+# IMAGE LOADING + NORMALIZATION
+# All images are resized to TARGET_WIDTH before any processing.
+# This is the fix for resolution mismatch between baseline and inspection images.
+# ──────────────────────────────────────────────
+def normalize_image(bgr_img):
+    """Resize image to TARGET_WIDTH, maintaining aspect ratio."""
+    h, w = bgr_img.shape[:2]
+    scale = CONFIG["TARGET_WIDTH"] / w
+    new_w = CONFIG["TARGET_WIDTH"]
+    new_h = int(h * scale)
+    resized = cv2.resize(bgr_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return resized
+
+def load_image_from_file(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Image not found: {path}")
+    bgr = cv2.imread(path)
+    if bgr is None:
+        raise ValueError(f"Could not read image: {path}")
+    bgr  = normalize_image(bgr)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    print(f"[FILE] Loaded: {os.path.basename(path)}  →  normalized to {bgr.shape[1]}×{bgr.shape[0]} px")
+    return rgb, gray
+
+# ──────────────────────────────────────────────
+# CAMERA
+# ──────────────────────────────────────────────
+def init_camera():
+    if not CAMERA_AVAILABLE:
+        print("[ERROR] Camera not available on this machine.")
+        return None
+    cam = Picamera2()
+    cfg = cam.create_still_configuration(
+        main={"size": CONFIG["CAPTURE_RESOLUTION"], "format": "RGB888"},
+        controls={
+            "AfMode": 0,
+            "LensPosition": CONFIG["LENS_POSITION"],
+            "ExposureTime": CONFIG["EXPOSURE_TIME"],
+            "AnalogueGain": 1.0,
+            "AwbEnable": False,
+            "ColourGains": (1.5, 1.5),
+        }
+    )
+    cam.configure(cfg)
+    cam.start()
+    time.sleep(2)
+    print("[CAM] Camera ready. Focus locked.")
+    return cam
+
+def capture_from_camera(cam):
+    """Capture from camera and normalize to TARGET_WIDTH like file images."""
+    frame = cam.capture_array()                        # RGB
+    bgr   = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    bgr   = normalize_image(bgr)
+    gray  = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    rgb   = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    return rgb, gray
+
+# ──────────────────────────────────────────────
+# IMAGE SOURCE PICKER (reused across modes)
+# ──────────────────────────────────────────────
+def get_image(prompt, cam=None):
+    """
+    Ask user: camera or file?
+    Returns (rgb, gray) or (None, None) on failure/cancel.
+    """
+    print(f"\n[{prompt}] Choose image source:")
+    if CAMERA_AVAILABLE and cam:
+        print("  1. Capture from camera")
+        print("  2. Pick from file (dialog)")
+    else:
+        print("  1. Pick from file (dialog)  [camera not available]")
+
+    choice = input("  Choice: ").strip()
+
+    if choice == "1" and CAMERA_AVAILABLE and cam:
+        input("  Press Enter to capture...")
+        return capture_from_camera(cam)
+
+    else:
+        print("  [FILE PICKER] Opening dialog...")
+        path = pick_image_file(title=prompt)
+        if not path:
+            print("  [CANCELLED]")
+            return None, None
+        try:
+            return load_image_from_file(path)
+        except Exception as e:
+            print(f"  [ERROR] {e}")
+            return None, None
+
+# ──────────────────────────────────────────────
+# INTERACTIVE ROI SELECTOR
+# ──────────────────────────────────────────────
+def select_roi_interactively(image_rgb):
+    """
+    Draw a rectangle on the image.
+    Enter/Space = confirm | C = clear | Q/Esc = cancel
+    Returns (x1, y1, x2, y2) in image coordinates, or None.
+    """
+    bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    h, w = bgr.shape[:2]
+
+    # Scale for display (don't modify actual coordinates)
+    max_display = 1280
+    scale = min(max_display / w, max_display / h, 1.0)
+    display_base = cv2.resize(bgr, (int(w * scale), int(h * scale)))
+
+    start_pt = None
+    end_pt   = None
+    drawing  = False
+
+    INSTRUCTIONS = [
+        "Draw box over jig top-edge strip  |  Enter=confirm  C=clear  Q=cancel",
+    ]
+
+    def draw_overlay():
+        out = display_base.copy()
+        cv2.putText(out, INSTRUCTIONS[0], (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
+        if start_pt and end_pt:
+            cv2.rectangle(out, start_pt, end_pt, (0, 255, 0), 2)
+            bw = abs(end_pt[0] - start_pt[0])
+            bh = abs(end_pt[1] - start_pt[1])
+            label_pos = (min(start_pt[0], end_pt[0]),
+                         min(start_pt[1], end_pt[1]) - 8)
+            cv2.putText(out, f"{bw}x{bh}px", label_pos,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        return out
+
+    def mouse(event, x, y, flags, param):
+        nonlocal start_pt, end_pt, drawing
+        if event == cv2.EVENT_LBUTTONDOWN:
+            drawing  = True
+            start_pt = (x, y)
+            end_pt   = (x, y)
+        elif event == cv2.EVENT_MOUSEMOVE and drawing:
+            end_pt = (x, y)
+        elif event == cv2.EVENT_LBUTTONUP:
+            drawing = False
+            end_pt  = (x, y)
+
+    print("\n[ROI] Window opening — draw a horizontal strip over the jig top edge.")
+    print("      Make it wide enough to span the full 20cm board width.")
+    print("      Make it tall enough that even a lifted board edge stays inside the box.\n")
+
+    cv2.namedWindow("ROI Selector", cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback("ROI Selector", mouse)
+
+    result = None
+    while True:
+        cv2.imshow("ROI Selector", draw_overlay())
+        key = cv2.waitKey(20) & 0xFF
+
+        if key in (13, 32):   # Enter or Space
+            if start_pt and end_pt and start_pt != end_pt:
+                # Convert display coords → original image coords
+                x1 = int(min(start_pt[0], end_pt[0]) / scale)
+                y1 = int(min(start_pt[1], end_pt[1]) / scale)
+                x2 = int(max(start_pt[0], end_pt[0]) / scale)
+                y2 = int(max(start_pt[1], end_pt[1]) / scale)
+                result = (x1, y1, x2, y2)
+                break
+            else:
+                print("[ROI] No box drawn. Click and drag first.")
+
+        elif key in (ord('c'), ord('C')):
+            start_pt = end_pt = None
+            print("[ROI] Cleared. Draw again.")
+
+        elif key in (ord('q'), ord('Q'), 27):   # Q or Escape
+            break
+
+    cv2.destroyAllWindows()
+    return result
+
+def run_roi_setup(cam=None):
+    rgb, _ = get_image("SET ROI", cam)
+    if rgb is None:
+        return
+
+    result = select_roi_interactively(rgb)
+    if result is None:
+        print("[ROI] Cancelled. ROI not changed.")
+        return
+
+    x1, y1, x2, y2 = result
+    CONFIG["ROI_X_START"] = x1
+    CONFIG["ROI_Y_START"] = y1
+    CONFIG["ROI_X_END"]   = x2
+    CONFIG["ROI_Y_END"]   = y2
+    save_roi_config()
+
+    print(f"\n[ROI] Saved!")
+    print(f"      X: {x1} → {x2}  ({x2 - x1} px wide at TARGET_WIDTH={CONFIG['TARGET_WIDTH']})")
+    print(f"      Y: {y1} → {y2}  ({y2 - y1} px tall)")
+
+# ──────────────────────────────────────────────
+# EDGE PROFILE EXTRACTION
+# For each column in the ROI, find the topmost Canny edge pixel.
+# Returns absolute Y coordinates in the full (normalized) image.
+# ──────────────────────────────────────────────
+def get_edge_profile(gray_img):
+    roi = gray_img[
+        CONFIG["ROI_Y_START"]:CONFIG["ROI_Y_END"],
+        CONFIG["ROI_X_START"]:CONFIG["ROI_X_END"]
+    ]
+    blurred = cv2.GaussianBlur(roi, (CONFIG["BLUR_KERNEL"], CONFIG["BLUR_KERNEL"]), 0)
+    edges   = cv2.Canny(blurred, CONFIG["CANNY_LOW"], CONFIG["CANNY_HIGH"])
+
+    roi_height = CONFIG["ROI_Y_END"] - CONFIG["ROI_Y_START"]
+    profile    = np.full(edges.shape[1], fill_value=float(roi_height), dtype=np.float32)
+
+    for col in range(edges.shape[1]):
+        rows = np.where(edges[:, col] > 0)[0]
+        if len(rows):
+            profile[col] = rows[0]   # topmost edge in this column
+
+    return profile + CONFIG["ROI_Y_START"]   # back to full-image Y coords
+
+# ──────────────────────────────────────────────
+# CALIBRATION
+# ──────────────────────────────────────────────
+def run_calibration(cam=None):
+    print("\n[CALIBRATE] Use your BARE JIG image (no PCB on it).")
+    rgb, gray = get_image("CALIBRATE — bare jig", cam)
+    if gray is None:
+        return None
+
+    profile         = get_edge_profile(gray)
+    baseline_median = float(np.median(profile))
+
+    data = {
+        "baseline_median_y": baseline_median,
+        "baseline_per_col":  profile.tolist(),
+        "timestamp":         datetime.now().isoformat(),
+        "target_width":      CONFIG["TARGET_WIDTH"],
+    }
+    with open(CONFIG["BASELINE_FILE"], "w") as f:
+        json.dump(data, f, indent=2)
+
+    os.makedirs(CONFIG["LOG_DIR"], exist_ok=True)
+    cal_img_path = os.path.join(CONFIG["LOG_DIR"], "calibration_image.jpg")
+    cv2.imwrite(cal_img_path, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+    print(f"[CALIBRATE] Done. Baseline median Y = {baseline_median:.1f} px")
+    print(f"[CALIBRATE] Image saved → {cal_img_path}")
+    return profile
+
+def load_baseline():
+    if not os.path.exists(CONFIG["BASELINE_FILE"]):
+        raise FileNotFoundError("No baseline.json — run Calibration first (option 2).")
+    with open(CONFIG["BASELINE_FILE"]) as f:
+        data = json.load(f)
+    print(f"[BASELINE] Loaded. Median Y = {data['baseline_median_y']:.1f} px")
+    return np.array(data["baseline_per_col"])
+
+# ──────────────────────────────────────────────
+# UPLIFT ANALYSIS
+# KEY CHANGE: uses abs(diff) so both positive AND negative uplift = FAIL.
+# A board sunken below baseline is also a seating error.
+# ──────────────────────────────────────────────
+def analyze_uplift(current_profile, baseline_profile):
+    # Resample if lengths differ (shouldn't happen after normalization, but safety net)
+    if len(current_profile) != len(baseline_profile):
+        print(f"[WARN] Profile length mismatch ({len(baseline_profile)} vs "
+              f"{len(current_profile)}). Resampling baseline.")
+        baseline_profile = np.interp(
+            np.linspace(0, 1, len(current_profile)),
+            np.linspace(0, 1, len(baseline_profile)),
+            baseline_profile
+        )
+
+    # diff > 0  → current edge is ABOVE baseline → board lifted
+    # diff < 0  → current edge is BELOW baseline → board sunken / bad seating
+    # Both are errors, so we use abs
+    diff       = baseline_profile - current_profile
+    abs_diff   = np.abs(diff)
+    diff_mm    = diff / CONFIG["PX_PER_MM"]
+    abs_mm     = abs_diff / CONFIG["PX_PER_MM"]
+
+    flagged    = abs_diff > CONFIG["UPLIFT_THRESHOLD_PX"]
+    max_abs_mm = float(np.max(abs_mm))
+    max_raw_mm = float(diff_mm[np.argmax(abs_diff)])   # signed value for reporting
+
+    fail_regions = []
+    in_region    = False
+    region_start = 0
+    total_cols   = len(flagged)
+
+    for i in range(total_cols + 1):
+        is_flagged = (i < total_cols) and flagged[i]
+        if is_flagged and not in_region:
+            in_region    = True
+            region_start = i
+        elif not is_flagged and in_region:
+            in_region = False
+            length    = i - region_start
+            if length >= CONFIG["MIN_FAIL_COLUMNS"]:
+                seg = diff[region_start:i]
+                seg_mm = diff_mm[region_start:i]
+                fail_regions.append({
+                    "col_start":        region_start,
+                    "col_end":          i,
+                    "max_uplift_px":    float(np.max(np.abs(seg))),
+                    "max_uplift_mm":    float(np.max(np.abs(seg_mm))),
+                    "direction":        "lifted" if np.mean(seg) > 0 else "sunken",
+                    "x_start_mm":       (region_start / total_cols) * 200.0,
+                    "x_end_mm":         (i          / total_cols) * 200.0,
+                })
+
+    # Two independent failure conditions:
+    # 1. Contiguous region of flagged columns
+    # 2. Any single point exceeds MAX_MM_THRESHOLD (catches sharp localised spikes)
+    region_fail    = len(fail_regions) > 0
+    threshold_fail = max_abs_mm > CONFIG["MAX_MM_THRESHOLD"]
+    passed         = not (region_fail or threshold_fail)
+
+    return passed, fail_regions, diff, diff_mm, max_abs_mm, max_raw_mm
+
+# ──────────────────────────────────────────────
+# ANNOTATED OUTPUT IMAGE
+# ──────────────────────────────────────────────
+def save_annotated_image(color_img, current_profile, baseline_profile,
+                          diff, fail_regions, passed, timestamp):
+    os.makedirs(CONFIG["LOG_DIR"], exist_ok=True)
+    annotated = cv2.cvtColor(color_img, cv2.COLOR_RGB2BGR)
+    roi_x0    = CONFIG["ROI_X_START"]
+
+    # Green = baseline edge
+    for col_idx, by in enumerate(baseline_profile):
+        x, y = col_idx + roi_x0, int(by)
+        if 0 <= y < annotated.shape[0] and 0 <= x < annotated.shape[1]:
+            annotated[y, x] = (0, 255, 0)
+
+    # Current edge: yellow = ok, red = error (lifted OR sunken)
+    abs_diff = np.abs(diff)
+    for col_idx, cy in enumerate(current_profile):
+        x, y  = col_idx + roi_x0, int(cy)
+        color = (0, 0, 255) if abs_diff[col_idx] > CONFIG["UPLIFT_THRESHOLD_PX"] else (0, 255, 255)
+        if 0 <= y < annotated.shape[0] and 0 <= x < annotated.shape[1]:
+            annotated[y, x] = color
+
+    # Orange ROI box
+    cv2.rectangle(annotated,
+                  (CONFIG["ROI_X_START"], CONFIG["ROI_Y_START"]),
+                  (CONFIG["ROI_X_END"],   CONFIG["ROI_Y_END"]),
+                  (0, 165, 255), 2)
+
+    # Main result label
+    label       = "PASS" if passed else f"FAIL — {len(fail_regions)} region(s)"
+    label_color = (0, 200, 0) if passed else (0, 0, 255)
+    cv2.putText(annotated, label, (50, 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 2.5, label_color, 5)
+
+    # Per-region detail
+    y_off = 160
+    for r in fail_regions:
+        direction = "↑ lifted" if r["direction"] == "lifted" else "↓ sunken"
+        text = (f"  {direction}  {r['max_uplift_mm']:.2f}mm  "
+                f"@ {r['x_start_mm']:.0f}–{r['x_end_mm']:.0f}mm")
+        cv2.putText(annotated, text, (50, y_off),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
+        y_off += 55
+
+    fname = os.path.join(CONFIG["LOG_DIR"],
+                         f"{timestamp}_{'PASS' if passed else 'FAIL'}.jpg")
+    cv2.imwrite(fname, annotated)
+    print(f"[LOG] Annotated image → {fname}")
+    return fname
+
+# ──────────────────────────────────────────────
+# CORE INSPECTION (shared by camera + file modes)
+# ──────────────────────────────────────────────
+def inspect_image(color_img, gray, baseline_profile, source_label=""):
+    timestamp      = datetime.now().strftime("%Y%m%d_%H%M%S")
+    current_profile = get_edge_profile(gray)
+
+    passed, fail_regions, diff, diff_mm, max_abs_mm, max_raw_mm = analyze_uplift(
+        current_profile, baseline_profile
+    )
+
+    # Console summary
+    src = f"[{source_label}]  " if source_label else ""
+    print("\n" + "=" * 60)
+    print(f"  {src}RESULT:  {'✅  PASS' if passed else '❌  FAIL'}")
+    print(f"  Max deviation: {max_abs_mm:.3f} mm  "
+          f"({'lifted' if max_raw_mm > 0 else 'sunken'})")
+    print(f"  Threshold:     {CONFIG['MAX_MM_THRESHOLD']} mm")
+    if not passed:
+        if len(fail_regions):
+            print(f"  Fail regions ({len(fail_regions)}):")
+            for i, r in enumerate(fail_regions, 1):
+                direction = "↑ lifted" if r["direction"] == "lifted" else "↓ sunken"
+                print(f"    {i}. {direction}  {r['max_uplift_mm']:.2f}mm  "
+                      f"@ {r['x_start_mm']:.0f}–{r['x_end_mm']:.0f}mm from left")
+        else:
+            print(f"  [MAX_MM_THRESHOLD breach — no wide region, but spike detected]")
+    print("=" * 60)
+
+    img_path = save_annotated_image(
+        color_img, current_profile, baseline_profile,
+        diff, fail_regions, passed, timestamp
+    )
+
+    os.makedirs(CONFIG["LOG_DIR"], exist_ok=True)
+    log_entry = {
+        "timestamp":    timestamp,
+        "source":       source_label,
+        "result":       "PASS" if passed else "FAIL",
+        "max_mm":       round(max_abs_mm, 4),
+        "fail_regions": fail_regions,
+        "image":        img_path,
+    }
+    with open(os.path.join(CONFIG["LOG_DIR"], "inspection_log.jsonl"), "a") as f:
+        f.write(json.dumps(log_entry) + "\n")
+
+    return passed
+
+# ──────────────────────────────────────────────
+# MENU ACTIONS
+# ──────────────────────────────────────────────
+def action_inspect(cam, baseline_profile):
+    rgb, gray = get_image("INSPECT", cam)
+    if gray is not None:
+        inspect_image(rgb, gray, baseline_profile, source_label="CAMERA" if cam else "FILE")
+
+def action_test_file(baseline_profile):
+    while True:
+        print("\n[FILE PICKER] Opening dialog — select PCB inspection image...")
+        path = pick_image_file(title="Select PCB image to inspect")
+        if not path:
+            print("[CANCELLED]")
+            break
+        try:
+            rgb, gray = load_image_from_file(path)
+            inspect_image(rgb, gray, baseline_profile, source_label=os.path.basename(path))
+        except Exception as e:
+            print(f"[ERROR] {e}")
+        again = input("\nTest another image? [y/n]: ").strip().lower()
+        if again != "y":
+            break
+
+# ──────────────────────────────────────────────
+# MAIN MENU
+# ──────────────────────────────────────────────
+def main():
+    load_roi_config()
+
+    print("\n╔══════════════════════════════════════════════╗")
+    print("║       PCB Warpage Detection System           ║")
+    print("╠══════════════════════════════════════════════╣")
+    print("║  1. Inspect via camera                       ║")
+    print("║  2. Calibrate  (bare jig — no PCB)           ║")
+    print("║  3. Test on image file  (file picker)        ║")
+    print("║  4. Set ROI interactively                    ║")
+    print("║  5. Exit                                     ║")
+    print("╚══════════════════════════════════════════════╝")
+
+    cam              = None
+    baseline_profile = None
+
+    while True:
+        choice = input("\nSelect option [1–5]: ").strip()
+
+        # Lazy camera init — only when actually needed
+        if choice == "1":
+            if not CAMERA_AVAILABLE:
+                print("[ERROR] Camera not available. Use option 3 for file-based testing.")
+                continue
+            if cam is None:
+                cam = init_camera()
+                if cam is None:
+                    continue
+            if baseline_profile is None:
+                try:
+                    baseline_profile = load_baseline()
+                except FileNotFoundError as e:
+                    print(f"[ERROR] {e}")
+                    continue
+            action_inspect(cam, baseline_profile)
+
+        elif choice == "2":
+            if baseline_profile is not None:
+                confirm = input("[WARN] This will overwrite existing calibration. Continue? [y/n]: ").strip().lower()
+                if confirm != "y":
+                    continue
+            baseline_profile = run_calibration(cam)
+
+        elif choice == "3":
+            if baseline_profile is None:
+                try:
+                    baseline_profile = load_baseline()
+                except FileNotFoundError as e:
+                    print(f"[ERROR] {e}")
+                    continue
+            action_test_file(baseline_profile)
+
+        elif choice == "4":
+            run_roi_setup(cam)
+
+        elif choice == "5":
+            break
+
+        else:
+            print("  Invalid choice. Enter 1–5.")
+
+    if cam:
+        cam.stop()
+    print("\n[EXIT] Stopped.")
+
+if __name__ == "__main__":
+    main()
