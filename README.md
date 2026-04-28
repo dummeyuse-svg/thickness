@@ -142,3 +142,7 @@ def run_calibration(cam=None):
     print(f"[CALIBRATE] Done using {len(profiles)} images")
     return baseline_profile
 
+
+
+pip show PyQt5 2>/dev/null | head -3; python3 -c "import PyQt5" 2>&1 | head -3
+
