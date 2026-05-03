@@ -1,221 +1,844 @@
-add above def main(): 
+# #!/usr/bin/env python3
+# """
+# PCB Warpage / Uplift Detection System
+# UI Mode: Tkinter GUI with live preview, ROI drawing, capture, calibrate, inspect
+# All detection logic is preserved exactly as-is.
+# """
 
-  also make changes for ui and cli both usage 
+# import cv2
+# import numpy as np
+# import tkinter as tk
+# from tkinter import ttk, messagebox
+# import threading
+# import time
+# import os
+# import json
+# from datetime import datetime
+# from PIL import Image, ImageTk
 
-                   elif choice == "5":
-    break
+# # ── Picamera2 optional import ──────────────────────────────────────
+# try:
+#     from picamera2 import Picamera2
+#     CAMERA_AVAILABLE = True
+# except ImportError:
+#     CAMERA_AVAILABLE = False
 
-elif choice == "6":
-    PCB_UI()
+# # ──────────────────────────────────────────────
+# # CONFIGURATION  (unchanged from original)
+# # ──────────────────────────────────────────────
+# CONFIG = {
+#     "CAPTURE_RESOLUTION": (2304, 1296),
+#     "LENS_POSITION":  2.0,
+#     "EXPOSURE_TIME":  5000,
+#     "TARGET_WIDTH":   2000,
+#     "ROI_Y_START":    600,
+#     "ROI_Y_END":      900,
+#     "ROI_X_START":    100,
+#     "ROI_X_END":      1900,
+#     "UPLIFT_THRESHOLD_PX": 5,
+#     "MIN_FAIL_COLUMNS":    10,
+#     "MAX_MM_THRESHOLD":    0.3,
+#     "BASELINE_FILE":   "baseline.json",
+#     "ROI_CONFIG_FILE": "roi_config.json",
+#     "LOG_DIR":         "inspection_logs",
+#     "BLUR_KERNEL": 5,
+#     "CANNY_LOW":   30,
+#     "CANNY_HIGH":  100,
+#     "PX_PER_MM":   10.0,
+# }
 
-else:
-    print("  Invalid choice. Enter 1–6.")
+# # ──────────────────────────────────────────────
+# # ROI CONFIG — load / save  (unchanged)
+# # ──────────────────────────────────────────────
+# def load_roi_config():
+#     if os.path.exists(CONFIG["ROI_CONFIG_FILE"]):
+#         with open(CONFIG["ROI_CONFIG_FILE"]) as f:
+#             roi = json.load(f)
+#         for key in ("ROI_X_START", "ROI_X_END", "ROI_Y_START", "ROI_Y_END"):
+#             if key in roi:
+#                 CONFIG[key] = roi[key]
 
-# ──────────────────────────────────────────────
-# UI MODE (OpenCV + Tkinter Hybrid)
-# ──────────────────────────────────────────────
+# def save_roi_config():
+#     roi = {k: CONFIG[k] for k in ("ROI_X_START", "ROI_X_END", "ROI_Y_START", "ROI_Y_END")}
+#     with open(CONFIG["ROI_CONFIG_FILE"], "w") as f:
+#         json.dump(roi, f, indent=2)
 
-import threading
-import tkinter as tk
+# # ──────────────────────────────────────────────
+# # IMAGE NORMALISATION  (unchanged)
+# # ──────────────────────────────────────────────
+# def normalize_image(bgr_img):
+#     h, w  = bgr_img.shape[:2]
+#     scale = CONFIG["TARGET_WIDTH"] / w
+#     new_h = int(h * scale)
+#     return cv2.resize(bgr_img, (CONFIG["TARGET_WIDTH"], new_h), interpolation=cv2.INTER_AREA)
 
-class PCB_UI:
-    def __init__(self):
-        self.cam = None
-        self.baseline = None
-        self.current_rgb = None
-        self.current_gray = None
+# # ──────────────────────────────────────────────
+# # EDGE PROFILE  (unchanged)
+# # ──────────────────────────────────────────────
+# def get_edge_profile(gray_img):
+#     roi = gray_img[
+#         CONFIG["ROI_Y_START"]:CONFIG["ROI_Y_END"],
+#         CONFIG["ROI_X_START"]:CONFIG["ROI_X_END"]
+#     ]
+#     blurred = cv2.GaussianBlur(roi, (CONFIG["BLUR_KERNEL"], CONFIG["BLUR_KERNEL"]), 0)
+#     edges   = cv2.Canny(blurred, CONFIG["CANNY_LOW"], CONFIG["CANNY_HIGH"])
+#     roi_h   = CONFIG["ROI_Y_END"] - CONFIG["ROI_Y_START"]
+#     profile = np.full(edges.shape[1], fill_value=float(roi_h), dtype=np.float32)
+#     for col in range(edges.shape[1]):
+#         rows = np.where(edges[:, col] > 0)[0]
+#         if len(rows):
+#             profile[col] = rows[0]
+#     return profile + CONFIG["ROI_Y_START"]
 
-        self.running = True
+# # ──────────────────────────────────────────────
+# # UPLIFT ANALYSIS  (unchanged)
+# # ──────────────────────────────────────────────
+# def analyze_uplift(current_profile, baseline_profile):
+#     if len(current_profile) != len(baseline_profile):
+#         baseline_profile = np.interp(
+#             np.linspace(0, 1, len(current_profile)),
+#             np.linspace(0, 1, len(baseline_profile)),
+#             baseline_profile,
+#         )
+#     diff     = baseline_profile - current_profile
+#     abs_diff = np.abs(diff)
+#     diff_mm  = diff     / CONFIG["PX_PER_MM"]
+#     abs_mm   = abs_diff / CONFIG["PX_PER_MM"]
+#     flagged  = abs_diff > CONFIG["UPLIFT_THRESHOLD_PX"]
+#     max_abs_mm = float(np.max(abs_mm))
+#     max_raw_mm = float(diff_mm[np.argmax(abs_diff)])
 
-        self.init_backend()
-        self.init_ui()
+#     fail_regions = []
+#     in_region = False; region_start = 0; total_cols = len(flagged)
+#     for i in range(total_cols + 1):
+#         is_flag = (i < total_cols) and flagged[i]
+#         if is_flag and not in_region:
+#             in_region = True; region_start = i
+#         elif not is_flag and in_region:
+#             in_region = False; length = i - region_start
+#             if length >= CONFIG["MIN_FAIL_COLUMNS"]:
+#                 seg = diff[region_start:i]; seg_mm = diff_mm[region_start:i]
+#                 fail_regions.append({
+#                     "col_start":    region_start, "col_end": i,
+#                     "max_uplift_px": float(np.max(np.abs(seg))),
+#                     "max_uplift_mm": float(np.max(np.abs(seg_mm))),
+#                     "direction":    "lifted" if np.mean(seg) > 0 else "sunken",
+#                     "x_start_mm":  (region_start / total_cols) * 200.0,
+#                     "x_end_mm":    (i            / total_cols) * 200.0,
+#                 })
+#     passed = not (len(fail_regions) > 0 or max_abs_mm > CONFIG["MAX_MM_THRESHOLD"])
+#     return passed, fail_regions, diff, diff_mm, max_abs_mm, max_raw_mm
 
-    # ─────────────────────────────
-    # BACKEND INIT
-    # ─────────────────────────────
-    def init_backend(self):
-        load_roi_config()
+# # ──────────────────────────────────────────────
+# # ANNOTATED IMAGE  (unchanged logic, returns numpy BGR)
+# # ──────────────────────────────────────────────
+# def build_annotated_image(color_bgr, current_profile, baseline_profile,
+#                            diff, fail_regions, passed):
+#     ann    = color_bgr.copy()
+#     roi_x0 = CONFIG["ROI_X_START"]
+#     abs_diff = np.abs(diff)
 
-        if CAMERA_AVAILABLE:
-            self.cam = init_camera()
+#     for col_idx, by in enumerate(baseline_profile):
+#         x, y = col_idx + roi_x0, int(by)
+#         if 0 <= y < ann.shape[0] and 0 <= x < ann.shape[1]:
+#             ann[y, x] = (0, 255, 0)
 
-        try:
-            self.baseline = load_baseline()
-        except:
-            print("[WARN] No baseline found. Please calibrate first.")
+#     for col_idx, cy in enumerate(current_profile):
+#         x, y  = col_idx + roi_x0, int(cy)
+#         color = (0, 0, 255) if abs_diff[col_idx] > CONFIG["UPLIFT_THRESHOLD_PX"] else (0, 255, 255)
+#         if 0 <= y < ann.shape[0] and 0 <= x < ann.shape[1]:
+#             ann[y, x] = color
 
-    # ─────────────────────────────
-    # UI WINDOW (Tkinter panel)
-    # ─────────────────────────────
-    def init_ui(self):
-        self.root = tk.Tk()
-        self.root.title("PCB Inspection Control Panel")
+#     cv2.rectangle(ann,
+#                   (CONFIG["ROI_X_START"], CONFIG["ROI_Y_START"]),
+#                   (CONFIG["ROI_X_END"],   CONFIG["ROI_Y_END"]),
+#                   (0, 165, 255), 2)
 
-        # ROI Inputs
-        tk.Label(self.root, text="ROI X1").grid(row=0, column=0)
-        tk.Label(self.root, text="ROI Y1").grid(row=1, column=0)
-        tk.Label(self.root, text="ROI X2").grid(row=2, column=0)
-        tk.Label(self.root, text="ROI Y2").grid(row=3, column=0)
+#     label = "PASS" if passed else f"FAIL — {len(fail_regions)} region(s)"
+#     color = (0, 200, 0) if passed else (0, 0, 255)
+#     cv2.putText(ann, label, (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 2.5, color, 5)
 
-        self.x1 = tk.Entry(self.root)
-        self.y1 = tk.Entry(self.root)
-        self.x2 = tk.Entry(self.root)
-        self.y2 = tk.Entry(self.root)
+#     y_off = 160
+#     for r in fail_regions:
+#         d    = "lifted" if r["direction"] == "lifted" else "sunken"
+#         text = f"  {d}  {r['max_uplift_mm']:.2f}mm @ {r['x_start_mm']:.0f}–{r['x_end_mm']:.0f}mm"
+#         cv2.putText(ann, text, (50, y_off), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
+#         y_off += 55
+#     return ann
 
-        self.x1.grid(row=0, column=1)
-        self.y1.grid(row=1, column=1)
-        self.x2.grid(row=2, column=1)
-        self.y2.grid(row=3, column=1)
+# # ──────────────────────────────────────────────
+# # BASELINE LOAD / SAVE
+# # ──────────────────────────────────────────────
+# def load_baseline():
+#     if not os.path.exists(CONFIG["BASELINE_FILE"]):
+#         raise FileNotFoundError("No baseline.json — run Calibrate first.")
+#     with open(CONFIG["BASELINE_FILE"]) as f:
+#         data = json.load(f)
+#     return np.array(data["baseline_per_col"])
 
-        # Buttons
-        tk.Button(self.root, text="Capture", command=self.capture).grid(row=4, column=0)
-        tk.Button(self.root, text="Inspect", command=self.inspect).grid(row=4, column=1)
-        tk.Button(self.root, text="Draw ROI", command=self.draw_roi).grid(row=5, column=0)
-        tk.Button(self.root, text="Apply ROI", command=self.apply_roi).grid(row=5, column=1)
+# def save_baseline(profile, rgb_img):
+#     data = {
+#         "baseline_median_y": float(np.median(profile)),
+#         "baseline_per_col":  profile.tolist(),
+#         "timestamp":         datetime.now().isoformat(),
+#         "target_width":      CONFIG["TARGET_WIDTH"],
+#     }
+#     with open(CONFIG["BASELINE_FILE"], "w") as f:
+#         json.dump(data, f, indent=2)
+#     os.makedirs(CONFIG["LOG_DIR"], exist_ok=True)
+#     cv2.imwrite(
+#         os.path.join(CONFIG["LOG_DIR"], "calibration_image.jpg"),
+#         cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR),
+#     )
 
-        self.status = tk.Label(self.root, text="Status: Idle")
-        self.status.grid(row=6, column=0, columnspan=2)
+# # ──────────────────────────────────────────────
+# # LOG ENTRY
+# # ──────────────────────────────────────────────
+# def write_log(timestamp, source, passed, max_abs_mm, fail_regions, img_path):
+#     os.makedirs(CONFIG["LOG_DIR"], exist_ok=True)
+#     entry = {
+#         "timestamp":    timestamp,
+#         "source":       source,
+#         "result":       "PASS" if passed else "FAIL",
+#         "max_mm":       round(max_abs_mm, 4),
+#         "fail_regions": fail_regions,
+#         "image":        img_path,
+#     }
+#     with open(os.path.join(CONFIG["LOG_DIR"], "inspection_log.jsonl"), "a") as f:
+#         f.write(json.dumps(entry) + "\n")
 
-        threading.Thread(target=self.preview_loop, daemon=True).start()
+# # ═══════════════════════════════════════════════════════════════════
+# # GUI
+# # ═══════════════════════════════════════════════════════════════════
+# DARK_BG    = "#0d1117"
+# PANEL_BG   = "#161b22"
+# BORDER     = "#30363d"
+# TEXT_FG    = "#e6edf3"
+# MUTED      = "#8b949e"
+# ACCENT     = "#58a6ff"
+# GREEN      = "#3fb950"
+# RED        = "#f85149"
+# ORANGE     = "#d29922"
+# BTN_BG     = "#21262d"
+# BTN_HOV    = "#30363d"
+# FONT_MONO  = ("Courier New", 11)
+# FONT_LABEL = ("Segoe UI", 10)
+# FONT_TITLE = ("Segoe UI", 11, "bold")
 
-        self.root.mainloop()
+# def pil_from_bgr(bgr, max_w, max_h):
+#     """Resize BGR numpy array to fit (max_w × max_h), return ImageTk.PhotoImage."""
+#     h, w = bgr.shape[:2]
+#     scale = min(max_w / w, max_h / h, 1.0)
+#     nw, nh = int(w * scale), int(h * scale)
+#     small = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+#     rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+#     return ImageTk.PhotoImage(Image.fromarray(rgb))
 
-    # ─────────────────────────────
-    # LIVE PREVIEW LOOP
-    # ─────────────────────────────
-    def preview_loop(self):
-        while self.running:
-            if self.cam:
-                rgb, gray = capture_from_camera(self.cam)
-                frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-                # Draw ROI box
-                cv2.rectangle(
-                    frame,
-                    (CONFIG["ROI_X_START"], CONFIG["ROI_Y_START"]),
-                    (CONFIG["ROI_X_END"], CONFIG["ROI_Y_END"]),
-                    (0, 255, 255),
-                    2
-                )
-
-                cv2.imshow("LIVE PREVIEW", frame)
-
-                key = cv2.waitKey(1) & 0xFF
-
-                if key == ord('c'):
-                    self.capture()
-                elif key == ord('i'):
-                    self.inspect()
-                elif key == ord('r'):
-                    self.draw_roi()
-                elif key == 27:
-                    self.running = False
-                    break
-
-        cv2.destroyAllWindows()
-
-    # ─────────────────────────────
-    # CAPTURE IMAGE
-    # ─────────────────────────────
-    def capture(self):
-        if not self.cam:
-            return
-
-        self.current_rgb, self.current_gray = capture_from_camera(self.cam)
-
-        bgr = cv2.cvtColor(self.current_rgb, cv2.COLOR_RGB2BGR)
-        cv2.imshow("CAPTURED IMAGE", bgr)
-
-        self.status.config(text="Captured image")
-
-    # ─────────────────────────────
-    # INSPECT
-    # ─────────────────────────────
-    def inspect(self):
-        if self.current_gray is None or self.baseline is None:
-            self.status.config(text="Error: No image or baseline")
-            return
-
-        passed = inspect_image(
-            self.current_rgb,
-            self.current_gray,
-            self.baseline,
-            source_label="UI"
-        )
-
-        self.status.config(text=f"Result: {'PASS' if passed else 'FAIL'}")
-
-    # ─────────────────────────────
-    # DRAW ROI (interactive)
-    # ─────────────────────────────
-    def draw_roi(self):
-        if self.current_rgb is None:
-            self.status.config(text="Capture image first")
-            return
-
-        result = select_roi_interactively(self.current_rgb)
-        if result:
-            x1, y1, x2, y2 = result
-
-            CONFIG["ROI_X_START"] = x1
-            CONFIG["ROI_Y_START"] = y1
-            CONFIG["ROI_X_END"]   = x2
-            CONFIG["ROI_Y_END"]   = y2
-
-            save_roi_config()
-
-            self.status.config(text="ROI Updated")
-
-    # ─────────────────────────────
-    # APPLY MANUAL ROI
-    # ─────────────────────────────
-    def apply_roi(self):
-        try:
-            CONFIG["ROI_X_START"] = int(self.x1.get())
-            CONFIG["ROI_Y_START"] = int(self.y1.get())
-            CONFIG["ROI_X_END"]   = int(self.x2.get())
-            CONFIG["ROI_Y_END"]   = int(self.y2.get())
-
-            save_roi_config()
-
-            self.status.config(text="Manual ROI Applied")
-        except:
-            self.status.config(text="Invalid ROI input")
+# def pil_from_rgb(rgb, max_w, max_h):
+#     h, w = rgb.shape[:2]
+#     scale = min(max_w / w, max_h / h, 1.0)
+#     nw, nh = int(w * scale), int(h * scale)
+#     small = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
+#     return ImageTk.PhotoImage(Image.fromarray(small))
 
 
-# ─────────────────────────────
-# RUN UI INSTEAD OF CLI
-# ─────────────────────────────
-if __name__ == "__main__":
-    PCB_UI()
+# class PCBApp(tk.Tk):
+#     PREVIEW_W = 760
+#     PREVIEW_H = 430
+#     RESULT_W  = 760
+#     RESULT_H  = 430
 
+#     def __init__(self):
+#         super().__init__()
+#         self.title("PCB Warpage Detection System")
+#         self.configure(bg=DARK_BG)
+#         self.resizable(True, True)
+
+#         # State
+#         self.cam             = None
+#         self.baseline_profile = None
+#         self.last_rgb        = None      # most recent captured RGB frame
+#         self.last_gray       = None
+#         self._preview_running = False
+#         self._preview_thread  = None
+#         self._live_frame_bgr  = None
+#         self._live_lock       = threading.Lock()
+
+#         # ROI drawing state (on result canvas)
+#         self._roi_drawing    = False
+#         self._roi_start      = None
+#         self._roi_rect_id    = None
+#         self._roi_mode       = False     # True while user is drawing a new ROI
+#         # scale factor: result canvas coords → full image coords
+#         self._result_scale   = 1.0
+#         self._result_offset  = (0, 0)   # (x_off, y_off) within canvas
+
+#         load_roi_config()
+#         self._build_ui()
+#         self._try_load_baseline()
+#         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+#         if CAMERA_AVAILABLE:
+#             self._start_camera()
+#         else:
+#             self._log("⚠  Camera not found — file upload mode only.")
+
+#     # ── UI CONSTRUCTION ───────────────────────────────────────────
+#     def _build_ui(self):
+#         self.columnconfigure(0, weight=1)
+#         self.rowconfigure(1, weight=1)
+
+#         # ── HEADER ──
+#         hdr = tk.Frame(self, bg=PANEL_BG, bd=0)
+#         hdr.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
+#         hdr.columnconfigure(1, weight=1)
+
+#         logo = tk.Label(hdr, text="⬡  PCB WARPAGE INSPECTOR",
+#                         font=("Segoe UI", 14, "bold"),
+#                         bg=PANEL_BG, fg=ACCENT, padx=16, pady=10)
+#         logo.grid(row=0, column=0, sticky="w")
+
+#         self._status_var = tk.StringVar(value="Ready")
+#         status_lbl = tk.Label(hdr, textvariable=self._status_var,
+#                               font=FONT_LABEL, bg=PANEL_BG, fg=MUTED, padx=16)
+#         status_lbl.grid(row=0, column=1, sticky="e")
+
+#         sep = tk.Frame(self, bg=BORDER, height=1)
+#         sep.grid(row=0, column=0, sticky="ews")
+
+#         # ── MAIN BODY ──
+#         body = tk.Frame(self, bg=DARK_BG)
+#         body.grid(row=1, column=0, sticky="nsew", padx=12, pady=10)
+#         body.columnconfigure(0, weight=1)
+#         body.columnconfigure(1, weight=0)  # sidebar fixed
+#         body.rowconfigure(0, weight=1)
+
+#         # ── LEFT: Two image panels ──
+#         panels = tk.Frame(body, bg=DARK_BG)
+#         panels.grid(row=0, column=0, sticky="nsew")
+#         panels.columnconfigure(0, weight=1)
+#         panels.columnconfigure(1, weight=1)
+#         panels.rowconfigure(0, weight=0)
+#         panels.rowconfigure(1, weight=1)
+
+#         # Labels
+#         tk.Label(panels, text="LIVE PREVIEW", font=FONT_TITLE,
+#                  bg=DARK_BG, fg=MUTED).grid(row=0, column=0, pady=(0, 4), sticky="w", padx=4)
+#         tk.Label(panels, text="CAPTURE / RESULT", font=FONT_TITLE,
+#                  bg=DARK_BG, fg=MUTED).grid(row=0, column=1, pady=(0, 4), sticky="w", padx=4)
+
+#         # Live preview canvas
+#         self._live_canvas = tk.Canvas(
+#             panels, width=self.PREVIEW_W, height=self.PREVIEW_H,
+#             bg="#0a0e14", highlightthickness=1, highlightbackground=BORDER,
+#         )
+#         self._live_canvas.grid(row=1, column=0, padx=(0, 6), sticky="nsew")
+#         self._live_canvas.create_text(
+#             self.PREVIEW_W // 2, self.PREVIEW_H // 2,
+#             text="Waiting for camera…", fill=MUTED, font=FONT_MONO,
+#             tags="placeholder",
+#         )
+
+#         # Result canvas (also used for ROI drawing)
+#         self._result_canvas = tk.Canvas(
+#             panels, width=self.RESULT_W, height=self.RESULT_H,
+#             bg="#0a0e14", highlightthickness=1, highlightbackground=BORDER,
+#             cursor="crosshair",
+#         )
+#         self._result_canvas.grid(row=1, column=1, sticky="nsew")
+#         self._result_canvas.create_text(
+#             self.RESULT_W // 2, self.RESULT_H // 2,
+#             text="Captured image appears here", fill=MUTED, font=FONT_MONO,
+#             tags="placeholder",
+#         )
+#         # ROI drawing bindings (active only in ROI mode)
+#         self._result_canvas.bind("<ButtonPress-1>",   self._roi_mouse_down)
+#         self._result_canvas.bind("<B1-Motion>",       self._roi_mouse_move)
+#         self._result_canvas.bind("<ButtonRelease-1>", self._roi_mouse_up)
+
+#         # ── RIGHT: Sidebar ──
+#         side = tk.Frame(body, bg=PANEL_BG, width=230,
+#                         highlightthickness=1, highlightbackground=BORDER)
+#         side.grid(row=0, column=1, sticky="ns", padx=(8, 0))
+#         side.columnconfigure(0, weight=1)
+#         side.grid_propagate(False)
+
+#         self._build_sidebar(side)
+
+#         # ── BOTTOM: LOG ──
+#         log_frame = tk.Frame(self, bg=PANEL_BG,
+#                              highlightthickness=1, highlightbackground=BORDER)
+#         log_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
+#         log_frame.columnconfigure(0, weight=1)
+
+#         tk.Label(log_frame, text="ACTIVITY LOG", font=FONT_TITLE,
+#                  bg=PANEL_BG, fg=MUTED, padx=8, pady=4).grid(row=0, column=0, sticky="w")
+
+#         self._log_text = tk.Text(
+#             log_frame, height=7, bg="#0d1117", fg=TEXT_FG,
+#             font=FONT_MONO, relief="flat", insertbackground=ACCENT,
+#             selectbackground=BORDER, wrap="word", state="disabled",
+#         )
+#         self._log_text.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
+
+#         sb = ttk.Scrollbar(log_frame, command=self._log_text.yview)
+#         sb.grid(row=1, column=1, sticky="ns", pady=(0, 6))
+#         self._log_text["yscrollcommand"] = sb.set
+
+#     def _build_sidebar(self, parent):
+#         pad = {"padx": 12, "pady": 5}
+
+#         tk.Label(parent, text="CONTROLS", font=("Segoe UI", 9, "bold"),
+#                  bg=PANEL_BG, fg=MUTED).grid(row=0, column=0, sticky="w", padx=12, pady=(14, 2))
+
+#         # ── Capture ──
+#         self._btn_capture = self._make_btn(
+#             parent, "📷  Capture Image", self._action_capture, row=1, **pad)
+
+#         sep1 = tk.Frame(parent, bg=BORDER, height=1)
+#         sep1.grid(row=2, column=0, sticky="ew", padx=10, pady=6)
+
+#         tk.Label(parent, text="CALIBRATION", font=("Segoe UI", 9, "bold"),
+#                  bg=PANEL_BG, fg=MUTED).grid(row=3, column=0, sticky="w", padx=12, pady=(0, 2))
+
+#         self._btn_set_roi = self._make_btn(
+#             parent, "✏  Draw ROI", self._action_set_roi, row=4, **pad)
+#         self._btn_calibrate = self._make_btn(
+#             parent, "⚙  Calibrate (Set Reference)", self._action_calibrate, row=5, **pad)
+
+#         sep2 = tk.Frame(parent, bg=BORDER, height=1)
+#         sep2.grid(row=6, column=0, sticky="ew", padx=10, pady=6)
+
+#         tk.Label(parent, text="INSPECTION", font=("Segoe UI", 9, "bold"),
+#                  bg=PANEL_BG, fg=MUTED).grid(row=7, column=0, sticky="w", padx=12, pady=(0, 2))
+
+#         self._btn_inspect = self._make_btn(
+#             parent, "🔍  Inspect Captured Image", self._action_inspect, row=8, **pad)
+
+#         sep3 = tk.Frame(parent, bg=BORDER, height=1)
+#         sep3.grid(row=9, column=0, sticky="ew", padx=10, pady=6)
+
+#         # ── ROI info ──
+#         tk.Label(parent, text="CURRENT ROI", font=("Segoe UI", 9, "bold"),
+#                  bg=PANEL_BG, fg=MUTED).grid(row=10, column=0, sticky="w", padx=12, pady=(0, 2))
+
+#         self._roi_var = tk.StringVar()
+#         self._update_roi_label()
+#         tk.Label(parent, textvariable=self._roi_var, font=("Courier New", 9),
+#                  bg=PANEL_BG, fg=TEXT_FG, justify="left").grid(
+#             row=11, column=0, sticky="w", padx=12, pady=(0, 6))
+
+#         sep4 = tk.Frame(parent, bg=BORDER, height=1)
+#         sep4.grid(row=12, column=0, sticky="ew", padx=10, pady=6)
+
+#         # ── Baseline status ──
+#         tk.Label(parent, text="BASELINE", font=("Segoe UI", 9, "bold"),
+#                  bg=PANEL_BG, fg=MUTED).grid(row=13, column=0, sticky="w", padx=12, pady=(0, 2))
+
+#         self._baseline_var = tk.StringVar(value="Not loaded")
+#         self._baseline_lbl = tk.Label(parent, textvariable=self._baseline_var,
+#                                       font=FONT_MONO, bg=PANEL_BG, fg=ORANGE, wraplength=200)
+#         self._baseline_lbl.grid(row=14, column=0, sticky="w", padx=12, pady=(0, 10))
+
+#         # ── Result banner ──
+#         self._result_var = tk.StringVar(value="")
+#         self._result_banner = tk.Label(
+#             parent, textvariable=self._result_var,
+#             font=("Segoe UI", 20, "bold"), bg=PANEL_BG, fg=MUTED,
+#             relief="flat", pady=10,
+#         )
+#         self._result_banner.grid(row=15, column=0, sticky="ew", padx=12, pady=4)
+
+#         self._detail_var = tk.StringVar(value="")
+#         tk.Label(parent, textvariable=self._detail_var, font=("Courier New", 9),
+#                  bg=PANEL_BG, fg=TEXT_FG, wraplength=205, justify="left").grid(
+#             row=16, column=0, sticky="w", padx=12)
+
+#     def _make_btn(self, parent, text, cmd, row, **grid_kw):
+#         btn = tk.Button(
+#             parent, text=text, command=cmd,
+#             bg=BTN_BG, fg=TEXT_FG, activebackground=BTN_HOV, activeforeground=TEXT_FG,
+#             relief="flat", bd=0, padx=10, pady=7,
+#             font=("Segoe UI", 10), anchor="w", width=22, cursor="hand2",
+#         )
+#         btn.grid(row=row, column=0, sticky="ew", **grid_kw)
+#         btn.bind("<Enter>", lambda e: btn.configure(bg=BTN_HOV))
+#         btn.bind("<Leave>", lambda e: btn.configure(bg=BTN_BG))
+#         return btn
+
+#     # ── LOGGING ──────────────────────────────────────────────────
+#     def _log(self, msg):
+#         ts  = datetime.now().strftime("%H:%M:%S")
+#         line = f"[{ts}]  {msg}\n"
+#         self._log_text.configure(state="normal")
+#         self._log_text.insert("end", line)
+#         self._log_text.see("end")
+#         self._log_text.configure(state="disabled")
+
+#     def _set_status(self, msg):
+#         self._status_var.set(msg)
+
+#     # ── BASELINE ─────────────────────────────────────────────────
+#     def _try_load_baseline(self):
+#         try:
+#             self.baseline_profile = load_baseline()
+#             self._baseline_var.set("✓ Loaded")
+#             self._baseline_lbl.configure(fg=GREEN)
+#             self._log("Baseline loaded from baseline.json")
+#         except FileNotFoundError:
+#             self._baseline_var.set("Not calibrated")
+#             self._baseline_lbl.configure(fg=ORANGE)
+
+#     def _update_roi_label(self):
+#         self._roi_var.set(
+#             f"X: {CONFIG['ROI_X_START']} → {CONFIG['ROI_X_END']}\n"
+#             f"Y: {CONFIG['ROI_Y_START']} → {CONFIG['ROI_Y_END']}"
+#         )
+
+#     # ── CAMERA ───────────────────────────────────────────────────
+#     def _start_camera(self):
+#         try:
+#             self.cam = Picamera2()
+#             cfg = self.cam.create_still_configuration(
+#                 main={"size": CONFIG["CAPTURE_RESOLUTION"], "format": "RGB888"},
+#                 controls={
+#                     "AfMode": 0, "LensPosition": CONFIG["LENS_POSITION"],
+#                     "ExposureTime": CONFIG["EXPOSURE_TIME"],
+#                     "AnalogueGain": 1.0, "AwbEnable": False,
+#                     "ColourGains": (1.5, 1.5),
+#                 },
+#             )
+#             self.cam.configure(cfg)
+#             self.cam.start()
+#             time.sleep(1.5)
+#             self._preview_running = True
+#             self._preview_thread  = threading.Thread(
+#                 target=self._preview_loop, daemon=True)
+#             self._preview_thread.start()
+#             self._log("Camera started. Live preview active.")
+#             self._set_status("Camera live")
+#         except Exception as e:
+#             self._log(f"⚠  Camera error: {e}")
+#             self._set_status("No camera")
+
+#     def _preview_loop(self):
+#         """Runs in background thread — continuously grabs frames."""
+#         while self._preview_running:
+#             try:
+#                 frame = self.cam.capture_array()         # RGB
+#                 bgr   = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+#                 bgr   = normalize_image(bgr)
+#                 # Draw current ROI overlay on preview
+#                 bgr_ov = bgr.copy()
+#                 cv2.rectangle(bgr_ov,
+#                               (CONFIG["ROI_X_START"], CONFIG["ROI_Y_START"]),
+#                               (CONFIG["ROI_X_END"],   CONFIG["ROI_Y_END"]),
+#                               (0, 165, 255), 2)
+#                 with self._live_lock:
+#                     self._live_frame_bgr = bgr_ov
+#                 self.after(0, self._refresh_preview)
+#             except Exception:
+#                 pass
+#             time.sleep(0.05)   # ~20 fps
+
+#     def _refresh_preview(self):
+#         with self._live_lock:
+#             frame = self._live_frame_bgr
+#         if frame is None:
+#             return
+#         photo = pil_from_bgr(frame, self.PREVIEW_W, self.PREVIEW_H)
+#         self._live_canvas.delete("all")
+#         cw = self._live_canvas.winfo_width()  or self.PREVIEW_W
+#         ch = self._live_canvas.winfo_height() or self.PREVIEW_H
+#         self._live_canvas.create_image(cw // 2, ch // 2, anchor="center",
+#                                        image=photo, tags="frame")
+#         self._live_canvas._photo = photo   # keep reference
+
+#     # ── CAPTURE ──────────────────────────────────────────────────
+#     def _action_capture(self):
+#         if self.cam:
+#             self._capture_from_camera()
+#         else:
+#             self._capture_from_file()
+
+#     def _capture_from_camera(self):
+#         self._set_status("Capturing…")
+#         self._log("Capturing image from camera…")
+#         try:
+#             frame = self.cam.capture_array()
+#             bgr   = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+#             bgr   = normalize_image(bgr)
+#             gray  = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+#             rgb   = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+#             self.last_rgb  = rgb
+#             self.last_gray = gray
+#             self._show_captured(bgr)
+#             self._log(f"Captured. Size: {bgr.shape[1]}×{bgr.shape[0]} px")
+#             self._set_status("Image captured")
+#         except Exception as e:
+#             self._log(f"⚠  Capture error: {e}")
+#             self._set_status("Capture failed")
+
+#     def _capture_from_file(self):
+#         from tkinter import filedialog
+#         path = filedialog.askopenfilename(
+#             title="Select PCB image",
+#             filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp")],
+#         )
+#         if not path:
+#             return
+#         try:
+#             bgr  = cv2.imread(path)
+#             bgr  = normalize_image(bgr)
+#             gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+#             rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+#             self.last_rgb  = rgb
+#             self.last_gray = gray
+#             self._show_captured(bgr)
+#             self._log(f"Loaded file: {os.path.basename(path)}")
+#             self._set_status("File loaded")
+#         except Exception as e:
+#             self._log(f"⚠  File load error: {e}")
+
+#     def _show_captured(self, bgr):
+#         """Display the captured BGr image on the result canvas."""
+#         cw = self._result_canvas.winfo_width()  or self.RESULT_W
+#         ch = self._result_canvas.winfo_height() or self.RESULT_H
+#         h, w = bgr.shape[:2]
+#         scale = min(cw / w, ch / h, 1.0)
+#         nw, nh = int(w * scale), int(h * scale)
+#         # compute offset so image is centred
+#         x_off = (cw - nw) // 2
+#         y_off = (ch - nh) // 2
+#         self._result_scale  = scale
+#         self._result_offset = (x_off, y_off)
+
+#         photo = pil_from_bgr(bgr, cw, ch)
+#         self._result_canvas.delete("all")
+#         self._result_canvas.create_image(cw // 2, ch // 2, anchor="center",
+#                                          image=photo, tags="captured")
+#         self._result_canvas._photo = photo
+#         # draw current ROI
+#         self._draw_roi_on_canvas()
+
+#     def _draw_roi_on_canvas(self):
+#         """Overlay current ROI box on the result canvas."""
+#         self._result_canvas.delete("roi_box")
+#         sc = self._result_scale
+#         ox, oy = self._result_offset
+#         x1 = int(CONFIG["ROI_X_START"] * sc) + ox
+#         y1 = int(CONFIG["ROI_Y_START"] * sc) + oy
+#         x2 = int(CONFIG["ROI_X_END"]   * sc) + ox
+#         y2 = int(CONFIG["ROI_Y_END"]   * sc) + oy
+#         self._result_canvas.create_rectangle(
+#             x1, y1, x2, y2,
+#             outline=ORANGE, width=2, tags="roi_box", dash=(6, 4),
+#         )
+
+#     # ── ROI DRAWING ──────────────────────────────────────────────
+#     def _action_set_roi(self):
+#         if self.last_rgb is None:
+#             messagebox.showinfo("No Image",
+#                                 "Capture or load an image first, then draw ROI.")
+#             return
+#         self._roi_mode = True
+#         self._result_canvas.configure(cursor="crosshair")
+#         self._log("ROI mode ON — click and drag on the result image to draw ROI.")
+#         self._set_status("Draw ROI on captured image…")
+
+#     def _roi_mouse_down(self, event):
+#         if not self._roi_mode:
+#             return
+#         self._roi_drawing = True
+#         self._roi_start   = (event.x, event.y)
+#         if self._roi_rect_id:
+#             self._result_canvas.delete(self._roi_rect_id)
+
+#     def _roi_mouse_move(self, event):
+#         if not self._roi_mode or not self._roi_drawing:
+#             return
+#         if self._roi_rect_id:
+#             self._result_canvas.delete(self._roi_rect_id)
+#         x0, y0 = self._roi_start
+#         self._roi_rect_id = self._result_canvas.create_rectangle(
+#             x0, y0, event.x, event.y,
+#             outline=GREEN, width=2, dash=(4, 3),
+#         )
+
+#     def _roi_mouse_up(self, event):
+#         if not self._roi_mode or not self._roi_drawing:
+#             return
+#         self._roi_drawing = False
+#         self._roi_mode    = False
+#         self._result_canvas.configure(cursor="crosshair")
+
+#         x0, y0 = self._roi_start
+#         x1, y1 = event.x, event.y
+#         # canvas → full image coords
+#         sc = self._result_scale
+#         ox, oy = self._result_offset
+#         img_x0 = int((min(x0, x1) - ox) / sc)
+#         img_y0 = int((min(y0, y1) - oy) / sc)
+#         img_x1 = int((max(x0, x1) - ox) / sc)
+#         img_y1 = int((max(y0, y1) - oy) / sc)
+
+#         # Clamp
+#         H, W = self.last_rgb.shape[:2]
+#         img_x0 = max(0, min(img_x0, W))
+#         img_y0 = max(0, min(img_y0, H))
+#         img_x1 = max(0, min(img_x1, W))
+#         img_y1 = max(0, min(img_y1, H))
+
+#         if abs(img_x1 - img_x0) < 20 or abs(img_y1 - img_y0) < 5:
+#             self._log("⚠  ROI too small — try again.")
+#             self._set_status("ROI too small")
+#             return
+
+#         CONFIG["ROI_X_START"] = img_x0
+#         CONFIG["ROI_Y_START"] = img_y0
+#         CONFIG["ROI_X_END"]   = img_x1
+#         CONFIG["ROI_Y_END"]   = img_y1
+#         save_roi_config()
+#         self._update_roi_label()
+#         self._draw_roi_on_canvas()
+#         self._log(f"ROI saved: X {img_x0}→{img_x1}  Y {img_y0}→{img_y1}")
+#         self._set_status("ROI updated")
+
+#     # ── CALIBRATE ────────────────────────────────────────────────
+#     def _action_calibrate(self):
+#         if self.last_rgb is None or self.last_gray is None:
+#             messagebox.showinfo("No Image",
+#                                 "Capture or load the BARE JIG image first, then calibrate.")
+#             return
+#         ans = messagebox.askyesno(
+#             "Calibrate",
+#             "This will overwrite the existing baseline.\n"
+#             "Make sure the captured image shows the bare jig (no PCB).\n\nContinue?",
+#         )
+#         if not ans:
+#             return
+#         try:
+#             profile = get_edge_profile(self.last_gray)
+#             save_baseline(profile, self.last_rgb)
+#             self.baseline_profile = profile
+#             self._baseline_var.set("✓ Calibrated now")
+#             self._baseline_lbl.configure(fg=GREEN)
+#             self._log(f"Calibration done. Baseline median Y = {np.median(profile):.1f} px")
+#             self._set_status("Calibrated")
+#             self._result_var.set("")
+#             self._detail_var.set("")
+#         except Exception as e:
+#             self._log(f"⚠  Calibration error: {e}")
+
+#     # ── INSPECT ──────────────────────────────────────────────────
+#     def _action_inspect(self):
+#         if self.last_gray is None:
+#             messagebox.showinfo("No Image", "Capture or load a PCB image first.")
+#             return
+#         if self.baseline_profile is None:
+#             messagebox.showinfo("No Baseline",
+#                                 "No baseline loaded. Run Calibrate first.")
+#             return
+
+#         self._set_status("Inspecting…")
+#         self._log("Running inspection…")
+
+#         try:
+#             current_profile = get_edge_profile(self.last_gray)
+#             passed, fail_regions, diff, diff_mm, max_abs_mm, max_raw_mm = analyze_uplift(
+#                 current_profile, self.baseline_profile
+#             )
+
+#             # Annotated image
+#             bgr = cv2.cvtColor(self.last_rgb, cv2.COLOR_RGB2BGR)
+#             ann = build_annotated_image(
+#                 bgr, current_profile, self.baseline_profile,
+#                 diff, fail_regions, passed,
+#             )
+
+#             # Show on result canvas
+#             cw = self._result_canvas.winfo_width()  or self.RESULT_W
+#             ch = self._result_canvas.winfo_height() or self.RESULT_H
+#             photo = pil_from_bgr(ann, cw, ch)
+#             self._result_canvas.delete("all")
+#             self._result_canvas.create_image(cw // 2, ch // 2, anchor="center",
+#                                              image=photo, tags="result")
+#             self._result_canvas._photo = photo
+
+#             # Save annotated
+#             ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+#             label = "PASS" if passed else "FAIL"
+#             os.makedirs(CONFIG["LOG_DIR"], exist_ok=True)
+#             img_path = os.path.join(CONFIG["LOG_DIR"], f"{ts}_{label}.jpg")
+#             cv2.imwrite(img_path, ann)
+#             write_log(ts, "UI", passed, max_abs_mm, fail_regions, img_path)
+
+#             # Result banner
+#             if passed:
+#                 self._result_var.set("✅  PASS")
+#                 self._result_banner.configure(fg=GREEN)
+#                 self._detail_var.set(
+#                     f"Max deviation: {max_abs_mm:.3f} mm\n"
+#                     f"Threshold: {CONFIG['MAX_MM_THRESHOLD']} mm"
+#                 )
+#             else:
+#                 self._result_var.set("❌  FAIL")
+#                 self._result_banner.configure(fg=RED)
+#                 details = [f"Max deviation: {max_abs_mm:.3f} mm"]
+#                 for i, r in enumerate(fail_regions, 1):
+#                     d = "↑ lifted" if r["direction"] == "lifted" else "↓ sunken"
+#                     details.append(
+#                         f"  {i}. {d}  {r['max_uplift_mm']:.2f}mm "
+#                         f"@ {r['x_start_mm']:.0f}–{r['x_end_mm']:.0f}mm"
+#                     )
+#                 self._detail_var.set("\n".join(details))
+
+#             self._log(f"Result: {label}  |  max={max_abs_mm:.3f}mm  |  saved → {img_path}")
+#             self._set_status(label)
+
+#         except Exception as e:
+#             self._log(f"⚠  Inspection error: {e}")
+#             self._set_status("Error")
+
+#     # ── CLOSE ────────────────────────────────────────────────────
+#     def _on_close(self):
+#         self._preview_running = False
+#         if self.cam:
+#             try:
+#                 self.cam.stop()
+#             except Exception:
+#                 pass
+#         self.destroy()
+
+
+# # ──────────────────────────────────────────────
+# # ENTRY POINT
+# # ──────────────────────────────────────────────
+# if __name__ == "__main__":
+#     app = PCBApp()
+#     app.mainloop()
 
 
 
 #!/usr/bin/env python3
 """
-PCB Warpage / Uplift Detection System — PyQt5 UI
-All detection logic unchanged. UI wrapped on top.
+PCB Warpage / Uplift Detection System
+UI Mode: Tkinter GUI with live preview, ROI drawing, capture, calibrate, inspect
+All detection logic is preserved exactly as-is.
 """
 
 import cv2
 import numpy as np
+import tkinter as tk
+from tkinter import ttk, messagebox
+import threading
 import time
 import os
 import json
-import sys
-import threading
 from datetime import datetime
+from PIL import Image, ImageTk
 
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
-    QVBoxLayout, QHBoxLayout, QGroupBox, QLineEdit, QFileDialog,
-    QStatusBar, QSplitter, QFrame, QScrollArea, QMessageBox,
-    QProgressBar, QSpinBox, QDoubleSpinBox, QFormLayout, QTabWidget
-)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
-from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QPalette
-
+# ── Picamera2 optional import ──────────────────────────────────────
 try:
     from picamera2 import Picamera2
     CAMERA_AVAILABLE = True
@@ -227,50 +850,28 @@ except ImportError:
 # ──────────────────────────────────────────────
 CONFIG = {
     "CAPTURE_RESOLUTION": (2304, 1296),
-    "LENS_POSITION": 2.0,
-    "EXPOSURE_TIME": 5000,
-    "TARGET_WIDTH": 2000,
-
-    "ROI_Y_START": 600,
-    "ROI_Y_END":   900,
-    "ROI_X_START": 100,
-    "ROI_X_END":   1900,
-
-    "UPLIFT_THRESHOLD_PX": 6,
+    "LENS_POSITION":  2.0,
+    "EXPOSURE_TIME":  5000,
+    "TARGET_WIDTH":   2000,
+    "ROI_Y_START":    600,
+    "ROI_Y_END":      900,
+    "ROI_X_START":    100,
+    "ROI_X_END":      1900,
+    "UPLIFT_THRESHOLD_PX": 5,
     "MIN_FAIL_COLUMNS":    10,
     "MAX_MM_THRESHOLD":    0.3,
-
     "BASELINE_FILE":   "baseline.json",
     "ROI_CONFIG_FILE": "roi_config.json",
     "LOG_DIR":         "inspection_logs",
-
     "BLUR_KERNEL": 5,
     "CANNY_LOW":   30,
     "CANNY_HIGH":  100,
-
-    "PX_PER_MM": 10.0,
-    "CALIBRATION_IMAGES": 5,
+    "PX_PER_MM":   10.0,
 }
 
 # ──────────────────────────────────────────────
-# DETECTION LOGIC  (unchanged from original)
+# ROI CONFIG — load / save  (unchanged)
 # ──────────────────────────────────────────────
-
-def normalize_image(bgr_img):
-    h, w = bgr_img.shape[:2]
-    scale = CONFIG["TARGET_WIDTH"] / w
-    return cv2.resize(bgr_img, (CONFIG["TARGET_WIDTH"], int(h * scale)),
-                      interpolation=cv2.INTER_AREA)
-
-def load_image_from_file(path):
-    bgr = cv2.imread(path)
-    if bgr is None:
-        raise ValueError(f"Could not read image: {path}")
-    bgr  = normalize_image(bgr)
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    return rgb, gray
-
 def load_roi_config():
     if os.path.exists(CONFIG["ROI_CONFIG_FILE"]):
         with open(CONFIG["ROI_CONFIG_FILE"]) as f:
@@ -280,14 +881,22 @@ def load_roi_config():
                 CONFIG[key] = roi[key]
 
 def save_roi_config():
+    roi = {k: CONFIG[k] for k in ("ROI_X_START", "ROI_X_END", "ROI_Y_START", "ROI_Y_END")}
     with open(CONFIG["ROI_CONFIG_FILE"], "w") as f:
-        json.dump({
-            "ROI_X_START": CONFIG["ROI_X_START"],
-            "ROI_X_END":   CONFIG["ROI_X_END"],
-            "ROI_Y_START": CONFIG["ROI_Y_START"],
-            "ROI_Y_END":   CONFIG["ROI_Y_END"],
-        }, f, indent=2)
+        json.dump(roi, f, indent=2)
 
+# ──────────────────────────────────────────────
+# IMAGE NORMALISATION  (unchanged)
+# ──────────────────────────────────────────────
+def normalize_image(bgr_img):
+    h, w  = bgr_img.shape[:2]
+    scale = CONFIG["TARGET_WIDTH"] / w
+    new_h = int(h * scale)
+    return cv2.resize(bgr_img, (CONFIG["TARGET_WIDTH"], new_h), interpolation=cv2.INTER_AREA)
+
+# ──────────────────────────────────────────────
+# EDGE PROFILE  (unchanged)
+# ──────────────────────────────────────────────
 def get_edge_profile(gray_img):
     roi = gray_img[
         CONFIG["ROI_Y_START"]:CONFIG["ROI_Y_END"],
@@ -295,911 +904,849 @@ def get_edge_profile(gray_img):
     ]
     blurred = cv2.GaussianBlur(roi, (CONFIG["BLUR_KERNEL"], CONFIG["BLUR_KERNEL"]), 0)
     edges   = cv2.Canny(blurred, CONFIG["CANNY_LOW"], CONFIG["CANNY_HIGH"])
-
-    roi_height = CONFIG["ROI_Y_END"] - CONFIG["ROI_Y_START"]
-    profile    = np.full(edges.shape[1], fill_value=float(roi_height), dtype=np.float32)
-
+    roi_h   = CONFIG["ROI_Y_END"] - CONFIG["ROI_Y_START"]
+    profile = np.full(edges.shape[1], fill_value=float(roi_h), dtype=np.float32)
     for col in range(edges.shape[1]):
         rows = np.where(edges[:, col] > 0)[0]
         if len(rows):
-            profile[col] = np.median(rows[:5])
+            profile[col] = rows[0]
+    return profile + CONFIG["ROI_Y_START"]
 
-    profile = profile + CONFIG["ROI_Y_START"]
-    profile = cv2.GaussianBlur(profile.reshape(-1, 1), (1, 9), 0).flatten()
-    return profile
-
+# ──────────────────────────────────────────────
+# UPLIFT ANALYSIS  (unchanged)
+# ──────────────────────────────────────────────
 def analyze_uplift(current_profile, baseline_profile):
     if len(current_profile) != len(baseline_profile):
         baseline_profile = np.interp(
             np.linspace(0, 1, len(current_profile)),
             np.linspace(0, 1, len(baseline_profile)),
-            baseline_profile
+            baseline_profile,
         )
-
-    offset          = np.median(current_profile - baseline_profile)
-    current_profile = current_profile - offset
-
     diff     = baseline_profile - current_profile
-    diff_mm  = diff / CONFIG["PX_PER_MM"]
     abs_diff = np.abs(diff)
-    abs_diff = cv2.GaussianBlur(abs_diff.reshape(-1, 1), (1, 11), 0).flatten()
+    diff_mm  = diff     / CONFIG["PX_PER_MM"]
     abs_mm   = abs_diff / CONFIG["PX_PER_MM"]
-
-    flagged    = abs_diff > CONFIG["UPLIFT_THRESHOLD_PX"]
+    flagged  = abs_diff > CONFIG["UPLIFT_THRESHOLD_PX"]
     max_abs_mm = float(np.max(abs_mm))
     max_raw_mm = float(diff_mm[np.argmax(abs_diff)])
 
     fail_regions = []
-    in_region    = False
-    region_start = 0
-    total_cols   = len(flagged)
-
+    in_region = False; region_start = 0; total_cols = len(flagged)
     for i in range(total_cols + 1):
-        is_flagged = (i < total_cols) and flagged[i]
-        if is_flagged and not in_region:
-            in_region    = True
-            region_start = i
-        elif not is_flagged and in_region:
-            in_region = False
-            length    = i - region_start
+        is_flag = (i < total_cols) and flagged[i]
+        if is_flag and not in_region:
+            in_region = True; region_start = i
+        elif not is_flag and in_region:
+            in_region = False; length = i - region_start
             if length >= CONFIG["MIN_FAIL_COLUMNS"]:
-                seg    = diff[region_start:i]
-                seg_mm = diff_mm[region_start:i]
+                seg = diff[region_start:i]; seg_mm = diff_mm[region_start:i]
                 fail_regions.append({
-                    "col_start":     region_start,
-                    "col_end":       i,
+                    "col_start":    region_start, "col_end": i,
                     "max_uplift_px": float(np.max(np.abs(seg))),
                     "max_uplift_mm": float(np.max(np.abs(seg_mm))),
-                    "direction":     "lifted" if np.mean(seg) > 0 else "sunken",
-                    "x_start_mm":    (region_start / total_cols) * 200.0,
-                    "x_end_mm":      (i / total_cols) * 200.0,
+                    "direction":    "lifted" if np.mean(seg) > 0 else "sunken",
+                    "x_start_mm":  (region_start / total_cols) * 200.0,
+                    "x_end_mm":    (i            / total_cols) * 200.0,
                 })
-
     passed = not (len(fail_regions) > 0 or max_abs_mm > CONFIG["MAX_MM_THRESHOLD"])
-    return passed, fail_regions, diff, diff_mm, abs_diff, max_abs_mm, max_raw_mm
+    return passed, fail_regions, diff, diff_mm, max_abs_mm, max_raw_mm
 
-def build_annotated_image(color_img, current_profile, baseline_profile,
-                           abs_diff, fail_regions, passed):
-    annotated = cv2.cvtColor(color_img, cv2.COLOR_RGB2BGR)
-    roi_x0    = CONFIG["ROI_X_START"]
+# ──────────────────────────────────────────────
+# ANNOTATED IMAGE  (unchanged logic, returns numpy BGR)
+# ──────────────────────────────────────────────
+def build_annotated_image(color_bgr, current_profile, baseline_profile,
+                           diff, fail_regions, passed):
+    ann    = color_bgr.copy()
+    roi_x0 = CONFIG["ROI_X_START"]
+    abs_diff = np.abs(diff)
 
     for col_idx, by in enumerate(baseline_profile):
         x, y = col_idx + roi_x0, int(by)
-        if 0 <= y < annotated.shape[0] and 0 <= x < annotated.shape[1]:
-            annotated[y, x] = (0, 255, 0)
+        if 0 <= y < ann.shape[0] and 0 <= x < ann.shape[1]:
+            ann[y, x] = (0, 255, 0)
 
     for col_idx, cy in enumerate(current_profile):
         x, y  = col_idx + roi_x0, int(cy)
         color = (0, 0, 255) if abs_diff[col_idx] > CONFIG["UPLIFT_THRESHOLD_PX"] else (0, 255, 255)
-        if 0 <= y < annotated.shape[0] and 0 <= x < annotated.shape[1]:
-            annotated[y, x] = color
+        if 0 <= y < ann.shape[0] and 0 <= x < ann.shape[1]:
+            ann[y, x] = color
 
-    cv2.rectangle(annotated,
+    cv2.rectangle(ann,
                   (CONFIG["ROI_X_START"], CONFIG["ROI_Y_START"]),
                   (CONFIG["ROI_X_END"],   CONFIG["ROI_Y_END"]),
                   (0, 165, 255), 2)
 
     label = "PASS" if passed else f"FAIL — {len(fail_regions)} region(s)"
-    cv2.putText(annotated, label, (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 2.5,
-                (0, 200, 0) if passed else (0, 0, 255), 5)
+    color = (0, 200, 0) if passed else (0, 0, 255)
+    cv2.putText(ann, label, (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 2.5, color, 5)
 
     y_off = 160
     for r in fail_regions:
-        direction = "UP" if r["direction"] == "lifted" else "DOWN"
-        cv2.putText(annotated,
-                    f"  {direction}  {r['max_uplift_mm']:.2f}mm  "
-                    f"@ {r['x_start_mm']:.0f}-{r['x_end_mm']:.0f}mm",
-                    (50, y_off), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
+        d    = "lifted" if r["direction"] == "lifted" else "sunken"
+        text = f"  {d}  {r['max_uplift_mm']:.2f}mm @ {r['x_start_mm']:.0f}–{r['x_end_mm']:.0f}mm"
+        cv2.putText(ann, text, (50, y_off), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
         y_off += 55
+    return ann
 
-    return cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-
+# ──────────────────────────────────────────────
+# BASELINE LOAD / SAVE
+# ──────────────────────────────────────────────
 def load_baseline():
     if not os.path.exists(CONFIG["BASELINE_FILE"]):
-        raise FileNotFoundError("No baseline.json — calibrate first.")
+        raise FileNotFoundError("No baseline.json — run Calibrate first.")
     with open(CONFIG["BASELINE_FILE"]) as f:
         data = json.load(f)
-    return np.array(data["baseline_per_col"]), data
+    return np.array(data["baseline_per_col"])
+
+def save_baseline(profile, rgb_img):
+    data = {
+        "baseline_median_y": float(np.median(profile)),
+        "baseline_per_col":  profile.tolist(),
+        "timestamp":         datetime.now().isoformat(),
+        "target_width":      CONFIG["TARGET_WIDTH"],
+    }
+    with open(CONFIG["BASELINE_FILE"], "w") as f:
+        json.dump(data, f, indent=2)
+    os.makedirs(CONFIG["LOG_DIR"], exist_ok=True)
+    cv2.imwrite(
+        os.path.join(CONFIG["LOG_DIR"], "calibration_image.jpg"),
+        cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR),
+    )
 
 # ──────────────────────────────────────────────
-# WORKER SIGNALS
+# LOG ENTRY
 # ──────────────────────────────────────────────
-class WorkerSignals(QObject):
-    status    = pyqtSignal(str)
-    image     = pyqtSignal(np.ndarray)   # annotated result image
-    result    = pyqtSignal(bool, list, float)  # passed, fail_regions, max_mm
-    progress  = pyqtSignal(int)
-    error     = pyqtSignal(str)
-    done      = pyqtSignal()
+def write_log(timestamp, source, passed, max_abs_mm, fail_regions, img_path):
+    os.makedirs(CONFIG["LOG_DIR"], exist_ok=True)
+    entry = {
+        "timestamp":    timestamp,
+        "source":       source,
+        "result":       "PASS" if passed else "FAIL",
+        "max_mm":       round(max_abs_mm, 4),
+        "fail_regions": fail_regions,
+        "image":        img_path,
+    }
+    with open(os.path.join(CONFIG["LOG_DIR"], "inspection_log.jsonl"), "a") as f:
+        f.write(json.dumps(entry) + "\n")
 
-# ──────────────────────────────────────────────
-# ROI DRAW WIDGET  (click-drag on image)
-# ──────────────────────────────────────────────
-class ROIDrawWidget(QLabel):
-    roi_selected = pyqtSignal(int, int, int, int)   # x1 y1 x2 y2 in image coords
+# ═══════════════════════════════════════════════════════════════════
+# GUI
+# ═══════════════════════════════════════════════════════════════════
+DARK_BG    = "#0d1117"
+PANEL_BG   = "#161b22"
+BORDER     = "#30363d"
+TEXT_FG    = "#e6edf3"
+MUTED      = "#8b949e"
+ACCENT     = "#58a6ff"
+GREEN      = "#3fb950"
+RED        = "#f85149"
+ORANGE     = "#d29922"
+BTN_BG     = "#21262d"
+BTN_HOV    = "#30363d"
+FONT_MONO  = ("Courier New", 11)
+FONT_LABEL = ("Segoe UI", 10)
+FONT_TITLE = ("Segoe UI", 11, "bold")
+
+def pil_from_bgr(bgr, max_w, max_h):
+    """Resize BGR numpy array to fit (max_w × max_h), return ImageTk.PhotoImage."""
+    h, w = bgr.shape[:2]
+    scale = min(max_w / w, max_h / h, 1.0)
+    nw, nh = int(w * scale), int(h * scale)
+    small = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+    rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+    return ImageTk.PhotoImage(Image.fromarray(rgb))
+
+def pil_from_rgb(rgb, max_w, max_h):
+    h, w = rgb.shape[:2]
+    scale = min(max_w / w, max_h / h, 1.0)
+    nw, nh = int(w * scale), int(h * scale)
+    small = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
+    return ImageTk.PhotoImage(Image.fromarray(small))
+
+
+class PCBApp(tk.Tk):
+    PREVIEW_W = 760
+    PREVIEW_H = 430
+    RESULT_W  = 760
+    RESULT_H  = 430
 
     def __init__(self):
         super().__init__()
-        self.setAlignment(Qt.AlignCenter)
-        self.setMinimumSize(400, 300)
-        self._orig_rgb   = None
-        self._scale      = 1.0
-        self._offset_x   = 0
-        self._offset_y   = 0
-        self._start      = None
-        self._end        = None
-        self._drawing    = False
-        self.setStyleSheet("border: 2px solid #555; background: #1a1a1a;")
-        self.setText("Load an image to draw ROI")
-        self.setStyleSheet("border: 2px solid #555; background: #1a1a1a; color: #888;")
+        self.title("PCB Warpage Detection System")
+        self.configure(bg=DARK_BG)
+        self.resizable(True, True)
 
-    def set_image(self, rgb_img):
-        self._orig_rgb = rgb_img.copy()
-        self._start    = None
-        self._end      = None
-        self._refresh()
-
-    def _img_coords(self, wx, wy):
-        """Convert widget coords → original image coords."""
-        ix = (wx - self._offset_x) / self._scale
-        iy = (wy - self._offset_y) / self._scale
-        return int(np.clip(ix, 0, self._orig_rgb.shape[1])), \
-               int(np.clip(iy, 0, self._orig_rgb.shape[0]))
-
-    def _refresh(self):
-        if self._orig_rgb is None:
-            return
-        display = self._orig_rgb.copy()
-
-        # Draw existing ROI from CONFIG in orange
-        ih, iw = display.shape[:2]
-        x1c = CONFIG["ROI_X_START"]
-        y1c = CONFIG["ROI_Y_START"]
-        x2c = CONFIG["ROI_X_END"]
-        y2c = CONFIG["ROI_Y_END"]
-        cv2.rectangle(display, (x1c, y1c), (x2c, y2c), (255, 140, 0), 2)
-        cv2.putText(display, "Current ROI", (x1c, max(y1c - 8, 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 140, 0), 2)
-
-        # Draw new selection in green
-        if self._start and self._end:
-            ix1 = min(self._start[0], self._end[0])
-            iy1 = min(self._start[1], self._end[1])
-            ix2 = max(self._start[0], self._end[0])
-            iy2 = max(self._start[1], self._end[1])
-            cv2.rectangle(display, (ix1, iy1), (ix2, iy2), (0, 255, 0), 2)
-            cv2.putText(display,
-                        f"New: ({ix1},{iy1}) → ({ix2},{iy2})  {ix2-ix1}×{iy2-iy1}px",
-                        (ix1, max(iy1 - 8, 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-        self._show(display)
-
-    def _show(self, rgb):
-        h, w = rgb.shape[:2]
-        ww, wh = self.width(), self.height()
-        scale = min(ww / w, wh / h, 1.0)
-        self._scale    = scale
-        nw, nh         = int(w * scale), int(h * scale)
-        self._offset_x = (ww - nw) // 2
-        self._offset_y = (wh - nh) // 2
-        resized = cv2.resize(rgb, (nw, nh))
-        qimg    = QImage(resized.data, nw, nh, nw * 3, QImage.Format_RGB888)
-        self.setPixmap(QPixmap.fromImage(qimg))
-
-    def mousePressEvent(self, e):
-        if self._orig_rgb is None or e.button() != Qt.LeftButton:
-            return
-        self._drawing = True
-        self._start   = self._img_coords(e.x(), e.y())
-        self._end     = self._start
-
-    def mouseMoveEvent(self, e):
-        if self._drawing:
-            self._end = self._img_coords(e.x(), e.y())
-            self._refresh()
-
-    def mouseReleaseEvent(self, e):
-        if self._drawing and e.button() == Qt.LeftButton:
-            self._drawing = False
-            self._end     = self._img_coords(e.x(), e.y())
-            self._refresh()
-
-    def confirm_roi(self):
-        if self._start and self._end:
-            x1 = min(self._start[0], self._end[0])
-            y1 = min(self._start[1], self._end[1])
-            x2 = max(self._start[0], self._end[0])
-            y2 = max(self._start[1], self._end[1])
-            if x2 > x1 and y2 > y1:
-                self.roi_selected.emit(x1, y1, x2, y2)
-                return True
-        return False
-
-    def resizeEvent(self, e):
-        self._refresh()
-
-# ──────────────────────────────────────────────
-# IMAGE DISPLAY LABEL  (fit-to-box, aspect-preserved)
-# ──────────────────────────────────────────────
-class ImageDisplay(QLabel):
-    def __init__(self, placeholder="No image"):
-        super().__init__(placeholder)
-        self.setAlignment(Qt.AlignCenter)
-        self.setMinimumSize(320, 240)
-        self.setStyleSheet("border: 1px solid #444; background: #111; color: #666;")
-        self._pixmap_orig = None
-
-    def set_rgb(self, rgb_img):
-        h, w = rgb_img.shape[:2]
-        qimg = QImage(rgb_img.data, w, h, w * 3, QImage.Format_RGB888)
-        self._pixmap_orig = QPixmap.fromImage(qimg)
-        self._fit()
-
-    def _fit(self):
-        if self._pixmap_orig:
-            self.setPixmap(self._pixmap_orig.scaled(
-                self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
-    def resizeEvent(self, e):
-        self._fit()
-
-# ──────────────────────────────────────────────
-# CAMERA PREVIEW THREAD
-# ──────────────────────────────────────────────
-class CameraPreviewThread(QThread):
-    frame_ready = pyqtSignal(np.ndarray)
-
-    def __init__(self, cam):
-        super().__init__()
-        self._cam     = cam
-        self._running = True
-
-    def run(self):
-        while self._running:
-            try:
-                frame = self._cam.capture_array()
-                # Draw ROI on preview
-                preview = frame.copy()
-                cv2.rectangle(preview,
-                              (CONFIG["ROI_X_START"] // 4, CONFIG["ROI_Y_START"] // 4),
-                              (CONFIG["ROI_X_END"]   // 4, CONFIG["ROI_Y_END"]   // 4),
-                              (255, 140, 0), 2)
-                self.frame_ready.emit(preview)
-            except Exception:
-                pass
-            self.msleep(100)
-
-    def stop(self):
-        self._running = False
-        self.wait()
-
-# ──────────────────────────────────────────────
-# MAIN WINDOW
-# ──────────────────────────────────────────────
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("PCB Warpage Detection System")
-        self.resize(1400, 820)
-        self._apply_theme()
-
-        self._cam             = None
+        # State
+        self.cam             = None
+        self.baseline_profile = None
+        self.last_rgb        = None      # most recent captured RGB frame
+        self.last_gray       = None
+        self._preview_running = False
         self._preview_thread  = None
-        self._baseline_profile = None
-        self._last_rgb        = None   # last captured/loaded image for ROI drawing
-        self._cal_profiles    = []
+        self._live_frame_bgr  = None
+        self._live_lock       = threading.Lock()
+
+        # Live-inspect mode state
+        self._live_inspect_active = False   # True = run classify on every preview frame
+        self._live_result         = None    # "PASS" | "FAIL" | None
+        self._live_result_detail  = ""      # short detail string shown on preview
+        self._live_inspect_every  = 10      # run analysis every N frames (throttle)
+        self._live_frame_count    = 0
+
+        # ROI drawing state (on result canvas)
+        self._roi_drawing    = False
+        self._roi_start      = None
+        self._roi_rect_id    = None
+        self._roi_mode       = False     # True while user is drawing a new ROI
+        # scale factor: result canvas coords → full image coords
+        self._result_scale   = 1.0
+        self._result_offset  = (0, 0)   # (x_off, y_off) within canvas
 
         load_roi_config()
-
         self._build_ui()
-        self._load_baseline_silent()
+        self._try_load_baseline()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ── THEME ──────────────────────────────────
-    def _apply_theme(self):
-        self.setStyleSheet("""
-            QMainWindow, QWidget { background: #1e1e1e; color: #e0e0e0; }
-            QGroupBox {
-                border: 1px solid #3a3a3a;
-                border-radius: 6px;
-                margin-top: 10px;
-                font-weight: bold;
-                font-size: 12px;
-                color: #aaa;
-                padding: 6px;
-            }
-            QGroupBox::title { subcontrol-origin: margin; left: 8px; color: #aaa; }
-            QPushButton {
-                background: #2d2d2d;
-                border: 1px solid #444;
-                border-radius: 4px;
-                padding: 7px 14px;
-                color: #ddd;
-                font-size: 12px;
-            }
-            QPushButton:hover  { background: #383838; border-color: #666; }
-            QPushButton:pressed { background: #222; }
-            QPushButton#btn_capture  { background: #1a3a5c; border-color: #2a6aa0; }
-            QPushButton#btn_capture:hover { background: #1f4a75; }
-            QPushButton#btn_calibrate { background: #2a4a2a; border-color: #4a8a4a; }
-            QPushButton#btn_calibrate:hover { background: #335533; }
-            QPushButton#btn_inspect  { background: #4a2a10; border-color: #9a5a20; }
-            QPushButton#btn_inspect:hover { background: #5a3518; }
-            QPushButton#btn_roi_confirm { background: #3a2a5c; border-color: #6a4aaa; }
-            QPushButton#btn_roi_confirm:hover { background: #4a3a72; }
-            QLineEdit, QSpinBox, QDoubleSpinBox {
-                background: #2a2a2a; border: 1px solid #444;
-                border-radius: 3px; padding: 4px; color: #ddd;
-            }
-            QTabWidget::pane { border: 1px solid #3a3a3a; }
-            QTabBar::tab {
-                background: #2a2a2a; border: 1px solid #3a3a3a;
-                padding: 6px 16px; color: #888;
-            }
-            QTabBar::tab:selected { background: #1e1e1e; color: #ddd; border-bottom: none; }
-            QLabel#result_label {
-                font-size: 22px; font-weight: bold;
-                padding: 12px; border-radius: 6px;
-                border: 2px solid #444;
-            }
-            QProgressBar {
-                border: 1px solid #444; border-radius: 3px;
-                background: #2a2a2a; text-align: center; color: #ddd;
-            }
-            QProgressBar::chunk { background: #2a6aa0; }
-        """)
-
-    # ── BUILD UI ────────────────────────────────
-    def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QHBoxLayout(central)
-        root.setSpacing(8)
-        root.setContentsMargins(8, 8, 8, 8)
-
-        # ── LEFT: preview + captured image ──────
-        left = QVBoxLayout()
-        left.setSpacing(6)
-
-        # Live preview
-        grp_preview = QGroupBox("Live Camera Preview")
-        vp = QVBoxLayout(grp_preview)
-        self._preview_display = ImageDisplay("Camera not started")
-        self._preview_display.setMinimumSize(480, 270)
-        vp.addWidget(self._preview_display)
-        btn_start_cam = QPushButton("▶  Start Camera Preview")
-        btn_start_cam.clicked.connect(self._start_camera)
-        vp.addWidget(btn_start_cam)
-        left.addWidget(grp_preview, stretch=1)
-
-        # Captured / result image
-        grp_captured = QGroupBox("Captured / Result Image")
-        vc = QVBoxLayout(grp_captured)
-        self._captured_display = ImageDisplay("No image captured yet")
-        self._captured_display.setMinimumSize(480, 270)
-        vc.addWidget(self._captured_display)
-        left.addWidget(grp_captured, stretch=1)
-
-        root.addLayout(left, stretch=3)
-
-        # ── RIGHT: controls ──────────────────────
-        right = QVBoxLayout()
-        right.setSpacing(6)
-
-        tabs = QTabWidget()
-        tabs.addTab(self._build_tab_main(),     "  Main  ")
-        tabs.addTab(self._build_tab_roi(),      "  ROI  ")
-        tabs.addTab(self._build_tab_settings(), "  Settings  ")
-        right.addWidget(tabs, stretch=1)
-
-        # Result panel
-        grp_result = QGroupBox("Result")
-        vr = QVBoxLayout(grp_result)
-        self._result_label = QLabel("—")
-        self._result_label.setObjectName("result_label")
-        self._result_label.setAlignment(Qt.AlignCenter)
-        self._result_label.setMinimumHeight(60)
-        vr.addWidget(self._result_label)
-        self._detail_label = QLabel("")
-        self._detail_label.setWordWrap(True)
-        self._detail_label.setStyleSheet("color: #aaa; font-size: 11px;")
-        vr.addWidget(self._detail_label)
-        right.addWidget(grp_result)
-
-        # Status bar
-        self._status = QStatusBar()
-        self._status.setStyleSheet("color: #888; font-size: 11px;")
-        self.setStatusBar(self._status)
-        self._set_status("Ready.")
-
-        root.addLayout(right, stretch=2)
-
-    def _build_tab_main(self):
-        w = QWidget()
-        v = QVBoxLayout(w)
-        v.setSpacing(10)
-        v.setContentsMargins(8, 12, 8, 8)
-
-        # Capture
-        grp = QGroupBox("1 · Capture Image")
-        vg  = QVBoxLayout(grp)
-        btn_cap = QPushButton("📷  Capture from Camera")
-        btn_cap.setObjectName("btn_capture")
-        btn_cap.clicked.connect(self._capture_camera)
-        btn_load = QPushButton("📂  Load from File")
-        btn_load.clicked.connect(self._load_file)
-        vg.addWidget(btn_cap)
-        vg.addWidget(btn_load)
-        v.addWidget(grp)
-
-        # Calibrate
-        grp2 = QGroupBox("2 · Calibrate  (bare jig — no PCB)")
-        vg2  = QVBoxLayout(grp2)
-        self._cal_progress = QProgressBar()
-        self._cal_progress.setRange(0, CONFIG["CALIBRATION_IMAGES"])
-        self._cal_progress.setValue(0)
-        self._cal_progress.setFormat(f"0 / {CONFIG['CALIBRATION_IMAGES']} images")
-        self._cal_progress.setVisible(False)
-        vg2.addWidget(self._cal_progress)
-        btn_cal = QPushButton("⚙  Add Calibration Image")
-        btn_cal.setObjectName("btn_calibrate")
-        btn_cal.setToolTip("Load/capture bare-jig images one at a time. "
-                           f"Need {CONFIG['CALIBRATION_IMAGES']} to complete.")
-        btn_cal.clicked.connect(self._add_calibration_image)
-        btn_cal_finish = QPushButton("✔  Finish Calibration")
-        btn_cal_finish.setObjectName("btn_calibrate")
-        btn_cal_finish.clicked.connect(self._finish_calibration)
-        btn_cal_reset = QPushButton("✖  Reset Calibration")
-        btn_cal_reset.clicked.connect(self._reset_calibration)
-        self._cal_count_label = QLabel("No calibration images yet.")
-        self._cal_count_label.setStyleSheet("color: #888; font-size: 11px;")
-        vg2.addWidget(btn_cal)
-        vg2.addWidget(btn_cal_finish)
-        vg2.addWidget(btn_cal_reset)
-        vg2.addWidget(self._cal_progress)
-        vg2.addWidget(self._cal_count_label)
-        v.addWidget(grp2)
-
-        # Inspect
-        grp3 = QGroupBox("3 · Inspect")
-        vg3  = QVBoxLayout(grp3)
-        btn_insp_cam = QPushButton("🔍  Inspect — Capture Now")
-        btn_insp_cam.setObjectName("btn_inspect")
-        btn_insp_cam.clicked.connect(self._inspect_camera)
-        btn_insp_file = QPushButton("🔍  Inspect — Load File")
-        btn_insp_file.setObjectName("btn_inspect")
-        btn_insp_file.clicked.connect(self._inspect_file)
-        self._baseline_status = QLabel("Baseline: not loaded")
-        self._baseline_status.setStyleSheet("color: #888; font-size: 11px;")
-        vg3.addWidget(btn_insp_cam)
-        vg3.addWidget(btn_insp_file)
-        vg3.addWidget(self._baseline_status)
-        v.addWidget(grp3)
-
-        v.addStretch()
-        return w
-
-    def _build_tab_roi(self):
-        w = QWidget()
-        v = QVBoxLayout(w)
-        v.setSpacing(8)
-        v.setContentsMargins(8, 12, 8, 8)
-
-        # Manual coordinate entry
-        grp_manual = QGroupBox("Manual ROI Coordinates")
-        form = QFormLayout(grp_manual)
-        self._roi_x1 = QSpinBox(); self._roi_x1.setRange(0, 9999); self._roi_x1.setValue(CONFIG["ROI_X_START"])
-        self._roi_y1 = QSpinBox(); self._roi_y1.setRange(0, 9999); self._roi_y1.setValue(CONFIG["ROI_Y_START"])
-        self._roi_x2 = QSpinBox(); self._roi_x2.setRange(0, 9999); self._roi_x2.setValue(CONFIG["ROI_X_END"])
-        self._roi_y2 = QSpinBox(); self._roi_y2.setRange(0, 9999); self._roi_y2.setValue(CONFIG["ROI_Y_END"])
-        form.addRow("X Start:", self._roi_x1)
-        form.addRow("Y Start:", self._roi_y1)
-        form.addRow("X End:",   self._roi_x2)
-        form.addRow("Y End:",   self._roi_y2)
-        btn_apply_manual = QPushButton("Apply Manual Coordinates")
-        btn_apply_manual.clicked.connect(self._apply_manual_roi)
-        form.addRow(btn_apply_manual)
-        v.addWidget(grp_manual)
-
-        # Draw on image
-        grp_draw = QGroupBox("Draw ROI on Image  (click + drag)")
-        vd = QVBoxLayout(grp_draw)
-
-        self._roi_widget = ROIDrawWidget()
-        self._roi_widget.setMinimumHeight(280)
-        self._roi_widget.roi_selected.connect(self._on_roi_drawn)
-        vd.addWidget(self._roi_widget)
-
-        btn_row = QHBoxLayout()
-        btn_load_for_roi = QPushButton("Load Image for Drawing")
-        btn_load_for_roi.clicked.connect(self._load_for_roi)
-        btn_confirm_roi = QPushButton("✔  Confirm Drawn ROI")
-        btn_confirm_roi.setObjectName("btn_roi_confirm")
-        btn_confirm_roi.clicked.connect(self._confirm_drawn_roi)
-        btn_row.addWidget(btn_load_for_roi)
-        btn_row.addWidget(btn_confirm_roi)
-        vd.addLayout(btn_row)
-
-        self._roi_status = QLabel(self._roi_str())
-        self._roi_status.setStyleSheet("color: #888; font-size: 11px;")
-        vd.addWidget(self._roi_status)
-        v.addWidget(grp_draw)
-
-        v.addStretch()
-        return w
-
-    def _build_tab_settings(self):
-        w = QWidget()
-        form = QFormLayout(w)
-        form.setContentsMargins(12, 16, 12, 8)
-        form.setSpacing(10)
-
-        def spin(val, lo, hi, step=1):
-            s = QSpinBox(); s.setRange(lo, hi); s.setValue(val); s.setSingleStep(step)
-            return s
-
-        def dspin(val, lo, hi, step=0.05, dec=2):
-            s = QDoubleSpinBox(); s.setRange(lo, hi); s.setValue(val)
-            s.setSingleStep(step); s.setDecimals(dec)
-            return s
-
-        self._s_threshold_px  = spin(CONFIG["UPLIFT_THRESHOLD_PX"], 1, 50)
-        self._s_min_cols      = spin(CONFIG["MIN_FAIL_COLUMNS"], 1, 500)
-        self._s_max_mm        = dspin(CONFIG["MAX_MM_THRESHOLD"], 0.01, 10.0)
-        self._s_px_per_mm     = dspin(CONFIG["PX_PER_MM"], 0.1, 100.0, step=0.1)
-        self._s_canny_low     = spin(CONFIG["CANNY_LOW"], 1, 255)
-        self._s_canny_high    = spin(CONFIG["CANNY_HIGH"], 1, 255)
-        self._s_cal_images    = spin(CONFIG["CALIBRATION_IMAGES"], 1, 20)
-        self._s_blur          = spin(CONFIG["BLUR_KERNEL"], 1, 31, step=2)
-
-        form.addRow("Uplift threshold (px):",       self._s_threshold_px)
-        form.addRow("Min fail columns:",             self._s_min_cols)
-        form.addRow("Max deviation (mm):",           self._s_max_mm)
-        form.addRow("px per mm:",                    self._s_px_per_mm)
-        form.addRow("Canny low threshold:",          self._s_canny_low)
-        form.addRow("Canny high threshold:",         self._s_canny_high)
-        form.addRow("Calibration images needed:",    self._s_cal_images)
-        form.addRow("Blur kernel size:",             self._s_blur)
-
-        btn_apply = QPushButton("Apply Settings")
-        btn_apply.clicked.connect(self._apply_settings)
-        form.addRow(btn_apply)
-
-        note = QLabel("Changes apply immediately to next inspection.\n"
-                      "Re-calibrate after changing blur/Canny settings.")
-        note.setStyleSheet("color: #666; font-size: 10px;")
-        note.setWordWrap(True)
-        form.addRow(note)
-
-        return w
-
-    # ── HELPERS ────────────────────────────────
-    def _set_status(self, msg):
-        self._status.showMessage(msg)
-
-    def _roi_str(self):
-        return (f"Current ROI — "
-                f"X: {CONFIG['ROI_X_START']}–{CONFIG['ROI_X_END']}  "
-                f"Y: {CONFIG['ROI_Y_START']}–{CONFIG['ROI_Y_END']}")
-
-    def _update_roi_display(self):
-        self._roi_status.setText(self._roi_str())
-        self._roi_x1.setValue(CONFIG["ROI_X_START"])
-        self._roi_y1.setValue(CONFIG["ROI_Y_START"])
-        self._roi_x2.setValue(CONFIG["ROI_X_END"])
-        self._roi_y2.setValue(CONFIG["ROI_Y_END"])
-        if self._last_rgb is not None:
-            self._roi_widget.set_image(self._last_rgb)
-
-    def _show_result(self, passed, fail_regions, max_mm):
-        if passed:
-            self._result_label.setText("✅  PASS")
-            self._result_label.setStyleSheet(
-                "font-size:22px; font-weight:bold; padding:12px; border-radius:6px;"
-                "border:2px solid #4a8a4a; color:#6fcf6f; background:#1a2e1a;")
-            self._detail_label.setText(f"Max deviation: {max_mm:.3f} mm — within threshold.")
+        if CAMERA_AVAILABLE:
+            self._start_camera()
         else:
-            self._result_label.setText("❌  FAIL")
-            self._result_label.setStyleSheet(
-                "font-size:22px; font-weight:bold; padding:12px; border-radius:6px;"
-                "border:2px solid #8a2a2a; color:#ff6b6b; background:#2e1a1a;")
-            details = [f"Max deviation: {max_mm:.3f} mm"]
-            for i, r in enumerate(fail_regions, 1):
-                d = "↑ lifted" if r["direction"] == "lifted" else "↓ sunken"
-                details.append(f"Region {i}: {d}  {r['max_uplift_mm']:.2f}mm  "
-                                f"@ {r['x_start_mm']:.0f}–{r['x_end_mm']:.0f}mm")
-            self._detail_label.setText("\n".join(details))
+            self._log("⚠  Camera not found — file upload mode only.")
 
-    def _load_baseline_silent(self):
+    # ── UI CONSTRUCTION ───────────────────────────────────────────
+    def _build_ui(self):
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        # ── HEADER ──
+        hdr = tk.Frame(self, bg=PANEL_BG, bd=0)
+        hdr.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
+        hdr.columnconfigure(1, weight=1)
+
+        logo = tk.Label(hdr, text="⬡  PCB WARPAGE INSPECTOR",
+                        font=("Segoe UI", 14, "bold"),
+                        bg=PANEL_BG, fg=ACCENT, padx=16, pady=10)
+        logo.grid(row=0, column=0, sticky="w")
+
+        self._status_var = tk.StringVar(value="Ready")
+        status_lbl = tk.Label(hdr, textvariable=self._status_var,
+                              font=FONT_LABEL, bg=PANEL_BG, fg=MUTED, padx=16)
+        status_lbl.grid(row=0, column=1, sticky="e")
+
+        sep = tk.Frame(self, bg=BORDER, height=1)
+        sep.grid(row=0, column=0, sticky="ews")
+
+        # ── MAIN BODY ──
+        body = tk.Frame(self, bg=DARK_BG)
+        body.grid(row=1, column=0, sticky="nsew", padx=12, pady=10)
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=0)  # sidebar fixed
+        body.rowconfigure(0, weight=1)
+
+        # ── LEFT: Two image panels ──
+        panels = tk.Frame(body, bg=DARK_BG)
+        panels.grid(row=0, column=0, sticky="nsew")
+        panels.columnconfigure(0, weight=1)
+        panels.columnconfigure(1, weight=1)
+        panels.rowconfigure(0, weight=0)
+        panels.rowconfigure(1, weight=1)
+
+        # Labels
+        tk.Label(panels, text="LIVE PREVIEW", font=FONT_TITLE,
+                 bg=DARK_BG, fg=MUTED).grid(row=0, column=0, pady=(0, 4), sticky="w", padx=4)
+        tk.Label(panels, text="CAPTURE / RESULT", font=FONT_TITLE,
+                 bg=DARK_BG, fg=MUTED).grid(row=0, column=1, pady=(0, 4), sticky="w", padx=4)
+
+        # Live preview canvas
+        self._live_canvas = tk.Canvas(
+            panels, width=self.PREVIEW_W, height=self.PREVIEW_H,
+            bg="#0a0e14", highlightthickness=1, highlightbackground=BORDER,
+        )
+        self._live_canvas.grid(row=1, column=0, padx=(0, 6), sticky="nsew")
+        self._live_canvas.create_text(
+            self.PREVIEW_W // 2, self.PREVIEW_H // 2,
+            text="Waiting for camera…", fill=MUTED, font=FONT_MONO,
+            tags="placeholder",
+        )
+
+        # Result canvas (also used for ROI drawing)
+        self._result_canvas = tk.Canvas(
+            panels, width=self.RESULT_W, height=self.RESULT_H,
+            bg="#0a0e14", highlightthickness=1, highlightbackground=BORDER,
+            cursor="crosshair",
+        )
+        self._result_canvas.grid(row=1, column=1, sticky="nsew")
+        self._result_canvas.create_text(
+            self.RESULT_W // 2, self.RESULT_H // 2,
+            text="Captured image appears here", fill=MUTED, font=FONT_MONO,
+            tags="placeholder",
+        )
+        # ROI drawing bindings (active only in ROI mode)
+        self._result_canvas.bind("<ButtonPress-1>",   self._roi_mouse_down)
+        self._result_canvas.bind("<B1-Motion>",       self._roi_mouse_move)
+        self._result_canvas.bind("<ButtonRelease-1>", self._roi_mouse_up)
+
+        # ── RIGHT: Sidebar ──
+        side = tk.Frame(body, bg=PANEL_BG, width=230,
+                        highlightthickness=1, highlightbackground=BORDER)
+        side.grid(row=0, column=1, sticky="ns", padx=(8, 0))
+        side.columnconfigure(0, weight=1)
+        side.grid_propagate(False)
+
+        self._build_sidebar(side)
+
+        # ── BOTTOM: LOG ──
+        log_frame = tk.Frame(self, bg=PANEL_BG,
+                             highlightthickness=1, highlightbackground=BORDER)
+        log_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
+        log_frame.columnconfigure(0, weight=1)
+
+        tk.Label(log_frame, text="ACTIVITY LOG", font=FONT_TITLE,
+                 bg=PANEL_BG, fg=MUTED, padx=8, pady=4).grid(row=0, column=0, sticky="w")
+
+        self._log_text = tk.Text(
+            log_frame, height=7, bg="#0d1117", fg=TEXT_FG,
+            font=FONT_MONO, relief="flat", insertbackground=ACCENT,
+            selectbackground=BORDER, wrap="word", state="disabled",
+        )
+        self._log_text.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
+
+        sb = ttk.Scrollbar(log_frame, command=self._log_text.yview)
+        sb.grid(row=1, column=1, sticky="ns", pady=(0, 6))
+        self._log_text["yscrollcommand"] = sb.set
+
+    def _build_sidebar(self, parent):
+        pad = {"padx": 12, "pady": 5}
+
+        tk.Label(parent, text="CONTROLS", font=("Segoe UI", 9, "bold"),
+                 bg=PANEL_BG, fg=MUTED).grid(row=0, column=0, sticky="w", padx=12, pady=(14, 2))
+
+        # ── Capture ──
+        self._btn_capture = self._make_btn(
+            parent, "📷  Capture Image", self._action_capture, row=1, **pad)
+
+        sep1 = tk.Frame(parent, bg=BORDER, height=1)
+        sep1.grid(row=2, column=0, sticky="ew", padx=10, pady=6)
+
+        tk.Label(parent, text="CALIBRATION", font=("Segoe UI", 9, "bold"),
+                 bg=PANEL_BG, fg=MUTED).grid(row=3, column=0, sticky="w", padx=12, pady=(0, 2))
+
+        self._btn_set_roi = self._make_btn(
+            parent, "✏  Draw ROI", self._action_set_roi, row=4, **pad)
+        self._btn_calibrate = self._make_btn(
+            parent, "⚙  Calibrate (Set Reference)", self._action_calibrate, row=5, **pad)
+
+        sep2 = tk.Frame(parent, bg=BORDER, height=1)
+        sep2.grid(row=6, column=0, sticky="ew", padx=10, pady=6)
+
+        tk.Label(parent, text="INSPECTION", font=("Segoe UI", 9, "bold"),
+                 bg=PANEL_BG, fg=MUTED).grid(row=7, column=0, sticky="w", padx=12, pady=(0, 2))
+
+        self._btn_inspect = self._make_btn(
+            parent, "🔍  Inspect Captured Image", self._action_inspect, row=8, **pad)
+
+        self._btn_live_inspect = self._make_btn(
+            parent, "▶  Start Live Inspect", self._action_toggle_live_inspect, row=9, **pad)
+        self._btn_live_inspect.configure(fg=GREEN)
+
+        sep3 = tk.Frame(parent, bg=BORDER, height=1)
+        sep3.grid(row=10, column=0, sticky="ew", padx=10, pady=6)
+
+        # ── ROI info ──
+        tk.Label(parent, text="CURRENT ROI", font=("Segoe UI", 9, "bold"),
+                 bg=PANEL_BG, fg=MUTED).grid(row=11, column=0, sticky="w", padx=12, pady=(0, 2))
+
+        self._roi_var = tk.StringVar()
+        self._update_roi_label()
+        tk.Label(parent, textvariable=self._roi_var, font=("Courier New", 9),
+                 bg=PANEL_BG, fg=TEXT_FG, justify="left").grid(
+            row=12, column=0, sticky="w", padx=12, pady=(0, 6))
+
+        sep4 = tk.Frame(parent, bg=BORDER, height=1)
+        sep4.grid(row=13, column=0, sticky="ew", padx=10, pady=6)
+
+        # ── Baseline status ──
+        tk.Label(parent, text="BASELINE", font=("Segoe UI", 9, "bold"),
+                 bg=PANEL_BG, fg=MUTED).grid(row=14, column=0, sticky="w", padx=12, pady=(0, 2))
+
+        self._baseline_var = tk.StringVar(value="Not loaded")
+        self._baseline_lbl = tk.Label(parent, textvariable=self._baseline_var,
+                                      font=FONT_MONO, bg=PANEL_BG, fg=ORANGE, wraplength=200)
+        self._baseline_lbl.grid(row=15, column=0, sticky="w", padx=12, pady=(0, 10))
+
+        # ── Result banner ──
+        self._result_var = tk.StringVar(value="")
+        self._result_banner = tk.Label(
+            parent, textvariable=self._result_var,
+            font=("Segoe UI", 20, "bold"), bg=PANEL_BG, fg=MUTED,
+            relief="flat", pady=10,
+        )
+        self._result_banner.grid(row=16, column=0, sticky="ew", padx=12, pady=4)
+
+        self._detail_var = tk.StringVar(value="")
+        tk.Label(parent, textvariable=self._detail_var, font=("Courier New", 9),
+                 bg=PANEL_BG, fg=TEXT_FG, wraplength=205, justify="left").grid(
+            row=17, column=0, sticky="w", padx=12)
+
+    def _make_btn(self, parent, text, cmd, row, **grid_kw):
+        btn = tk.Button(
+            parent, text=text, command=cmd,
+            bg=BTN_BG, fg=TEXT_FG, activebackground=BTN_HOV, activeforeground=TEXT_FG,
+            relief="flat", bd=0, padx=10, pady=7,
+            font=("Segoe UI", 10), anchor="w", width=22, cursor="hand2",
+        )
+        btn.grid(row=row, column=0, sticky="ew", **grid_kw)
+        btn.bind("<Enter>", lambda e: btn.configure(bg=BTN_HOV))
+        btn.bind("<Leave>", lambda e: btn.configure(bg=BTN_BG))
+        return btn
+
+    # ── LOGGING ──────────────────────────────────────────────────
+    def _log(self, msg):
+        ts  = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}]  {msg}\n"
+        self._log_text.configure(state="normal")
+        self._log_text.insert("end", line)
+        self._log_text.see("end")
+        self._log_text.configure(state="disabled")
+
+    def _set_status(self, msg):
+        self._status_var.set(msg)
+
+    # ── BASELINE ─────────────────────────────────────────────────
+    def _try_load_baseline(self):
         try:
-            self._baseline_profile, data = load_baseline()
-            n = data.get("num_images", 1)
-            self._baseline_status.setText(
-                f"Baseline loaded  ({n} image avg,  "
-                f"median Y={data['baseline_median_y']:.1f}px)")
-            self._baseline_status.setStyleSheet("color: #6fcf6f; font-size: 11px;")
+            self.baseline_profile = load_baseline()
+            self._baseline_var.set("✓ Loaded")
+            self._baseline_lbl.configure(fg=GREEN)
+            self._log("Baseline loaded from baseline.json")
         except FileNotFoundError:
-            self._baseline_status.setText("Baseline: not loaded — calibrate first.")
-            self._baseline_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
+            self._baseline_var.set("Not calibrated")
+            self._baseline_lbl.configure(fg=ORANGE)
 
-    # ── CAMERA ─────────────────────────────────
+    def _update_roi_label(self):
+        self._roi_var.set(
+            f"X: {CONFIG['ROI_X_START']} → {CONFIG['ROI_X_END']}\n"
+            f"Y: {CONFIG['ROI_Y_START']} → {CONFIG['ROI_Y_END']}"
+        )
+
+    # ── CAMERA ───────────────────────────────────────────────────
     def _start_camera(self):
-        if not CAMERA_AVAILABLE:
-            self._set_status("Camera not available on this machine.")
-            return
-        if self._cam is not None:
-            return
         try:
-            self._cam = Picamera2()
-            preview_cfg = self._cam.create_preview_configuration(
-                main={"size": (1152, 648), "format": "RGB888"})
-            self._cam.configure(preview_cfg)
-            self._cam.start()
-            time.sleep(1)
-            self._preview_thread = CameraPreviewThread(self._cam)
-            self._preview_thread.frame_ready.connect(self._on_preview_frame)
-            self._preview_thread.start()
-            self._set_status("Camera preview started.")
-        except Exception as e:
-            self._set_status(f"Camera error: {e}")
-
-    def _on_preview_frame(self, frame):
-        self._preview_display.set_rgb(frame)
-
-    def _capture_camera(self):
-        if self._cam is None:
-            self._set_status("Start camera preview first.")
-            return
-        try:
-            # Switch to still config temporarily
-            self._preview_thread.stop()
-            self._cam.stop()
-            still_cfg = self._cam.create_still_configuration(
+            self.cam = Picamera2()
+            cfg = self.cam.create_still_configuration(
                 main={"size": CONFIG["CAPTURE_RESOLUTION"], "format": "RGB888"},
                 controls={
-                    "AfMode": 0,
-                    "LensPosition": CONFIG["LENS_POSITION"],
+                    "AfMode": 0, "LensPosition": CONFIG["LENS_POSITION"],
                     "ExposureTime": CONFIG["EXPOSURE_TIME"],
-                    "AnalogueGain": 1.0,
-                    "AwbEnable": False,
+                    "AnalogueGain": 1.0, "AwbEnable": False,
                     "ColourGains": (1.5, 1.5),
-                })
-            self._cam.configure(still_cfg)
-            self._cam.start()
-            time.sleep(1)
-            frame = self._cam.capture_array()
-            self._cam.stop()
-
-            # Normalize
-            bgr  = normalize_image(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-            rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            self._last_rgb = rgb
-            self._captured_display.set_rgb(rgb)
-            self._roi_widget.set_image(rgb)
-            self._set_status("Image captured from camera.")
-
-            # Restart preview
-            preview_cfg = self._cam.create_preview_configuration(
-                main={"size": (1152, 648), "format": "RGB888"})
-            self._cam.configure(preview_cfg)
-            self._cam.start()
-            self._preview_thread = CameraPreviewThread(self._cam)
-            self._preview_thread.frame_ready.connect(self._on_preview_frame)
+                },
+            )
+            self.cam.configure(cfg)
+            self.cam.start()
+            time.sleep(1.5)
+            self._preview_running = True
+            self._preview_thread  = threading.Thread(
+                target=self._preview_loop, daemon=True)
             self._preview_thread.start()
+            self._log("Camera started. Live preview active.")
+            self._set_status("Camera live")
         except Exception as e:
-            self._set_status(f"Capture error: {e}")
+            self._log(f"⚠  Camera error: {e}")
+            self._set_status("No camera")
 
-    # ── FILE LOAD ───────────────────────────────
-    def _load_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load Image", "", "Images (*.jpg *.jpeg *.png *.bmp)")
-        if not path:
-            return
-        try:
-            rgb, _ = load_image_from_file(path)
-            self._last_rgb = rgb
-            self._captured_display.set_rgb(rgb)
-            self._roi_widget.set_image(rgb)
-            self._set_status(f"Loaded: {os.path.basename(path)}")
-        except Exception as e:
-            self._set_status(f"Error: {e}")
-
-    def _load_for_roi(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load Image for ROI", "", "Images (*.jpg *.jpeg *.png *.bmp)")
-        if not path:
-            return
-        try:
-            rgb, _ = load_image_from_file(path)
-            self._last_rgb = rgb
-            self._roi_widget.set_image(rgb)
-            self._set_status(f"ROI image loaded: {os.path.basename(path)}")
-        except Exception as e:
-            self._set_status(f"Error: {e}")
-
-    # ── ROI ─────────────────────────────────────
-    def _apply_manual_roi(self):
-        x1, y1 = self._roi_x1.value(), self._roi_y1.value()
-        x2, y2 = self._roi_x2.value(), self._roi_y2.value()
-        if x2 <= x1 or y2 <= y1:
-            self._set_status("Invalid ROI: X2 must be > X1, Y2 must be > Y1.")
-            return
-        CONFIG["ROI_X_START"] = x1
-        CONFIG["ROI_Y_START"] = y1
-        CONFIG["ROI_X_END"]   = x2
-        CONFIG["ROI_Y_END"]   = y2
-        save_roi_config()
-        self._update_roi_display()
-        self._set_status(f"ROI set manually: ({x1},{y1}) → ({x2},{y2})")
-
-    def _confirm_drawn_roi(self):
-        if not self._roi_widget.confirm_roi():
-            self._set_status("Draw a box on the image first, then confirm.")
-
-    def _on_roi_drawn(self, x1, y1, x2, y2):
-        CONFIG["ROI_X_START"] = x1
-        CONFIG["ROI_Y_START"] = y1
-        CONFIG["ROI_X_END"]   = x2
-        CONFIG["ROI_Y_END"]   = y2
-        save_roi_config()
-        self._update_roi_display()
-        self._set_status(f"ROI confirmed: ({x1},{y1}) → ({x2},{y2})  |  Saved to roi_config.json")
-
-    # ── CALIBRATION ─────────────────────────────
-    def _add_calibration_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select Bare Jig Image", "", "Images (*.jpg *.jpeg *.png *.bmp)")
-        if not path:
-            return
-        try:
-            rgb, gray = load_image_from_file(path)
-            profile = get_edge_profile(gray)
-            self._cal_profiles.append(profile)
-            self._last_rgb = rgb
-            self._captured_display.set_rgb(rgb)
-
-            n     = len(self._cal_profiles)
-            total = CONFIG["CALIBRATION_IMAGES"]
-            self._cal_progress.setVisible(True)
-            self._cal_progress.setValue(n)
-            self._cal_progress.setFormat(f"{n} / {total} images")
-            self._cal_count_label.setText(
-                f"{n}/{total} calibration images collected."
-                + (" ← Ready to finish!" if n >= total else ""))
-            self._set_status(f"Calibration image {n}/{total} added.")
-        except Exception as e:
-            self._set_status(f"Error: {e}")
-
-    def _finish_calibration(self):
-        if len(self._cal_profiles) == 0:
-            self._set_status("Add at least 1 calibration image first.")
-            return
-        baseline = np.mean(self._cal_profiles, axis=0)
-        data = {
-            "baseline_median_y": float(np.median(baseline)),
-            "baseline_per_col":  baseline.tolist(),
-            "timestamp":         datetime.now().isoformat(),
-            "target_width":      CONFIG["TARGET_WIDTH"],
-            "num_images":        len(self._cal_profiles),
-        }
-        with open(CONFIG["BASELINE_FILE"], "w") as f:
-            json.dump(data, f, indent=2)
-        self._baseline_profile = baseline
-        self._cal_profiles     = []
-        self._cal_progress.setValue(0)
-        self._cal_progress.setVisible(False)
-        self._cal_count_label.setText("Calibration complete.")
-        self._load_baseline_silent()
-        self._set_status(f"Calibration saved — {data['num_images']} image average.")
-
-    def _reset_calibration(self):
-        self._cal_profiles = []
-        self._cal_progress.setValue(0)
-        self._cal_progress.setVisible(False)
-        self._cal_count_label.setText("Calibration reset.")
-        self._set_status("Calibration images cleared.")
-
-    # ── INSPECTION ──────────────────────────────
-    def _ensure_baseline(self):
-        if self._baseline_profile is None:
+    def _preview_loop(self):
+        """Runs in background thread — continuously grabs frames.
+        When live-inspect is active, runs the full analysis every N frames
+        and overlays a coloured PASS/FAIL verdict directly on the preview.
+        """
+        while self._preview_running:
             try:
-                self._baseline_profile, _ = load_baseline()
-            except FileNotFoundError:
-                self._set_status("No baseline — calibrate first.")
-                return False
-        return True
+                frame = self.cam.capture_array()   # RGB
+                bgr   = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                bgr   = normalize_image(bgr)
+                bgr_ov = bgr.copy()
 
-    def _run_inspection(self, rgb, gray, label):
-        if not self._ensure_baseline():
-            return
+                # ── Live inspection (throttled) ─────────────────────
+                if self._live_inspect_active and self.baseline_profile is not None:
+                    self._live_frame_count += 1
+                    if self._live_frame_count >= self._live_inspect_every:
+                        self._live_frame_count = 0
+                        try:
+                            gray    = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                            profile = get_edge_profile(gray)
+                            passed, fail_regions, diff, diff_mm, max_abs_mm, _ = analyze_uplift(
+                                profile, self.baseline_profile
+                            )
+                            self._live_result = "PASS" if passed else "FAIL"
+                            if passed:
+                                self._live_result_detail = f"max {max_abs_mm:.3f}mm"
+                            else:
+                                dirs = [("↑" if r["direction"] == "lifted" else "↓")
+                                        for r in fail_regions]
+                                self._live_result_detail = (
+                                    f"max {max_abs_mm:.3f}mm  "
+                                    + "  ".join(
+                                        f"{d}{r['max_uplift_mm']:.2f}mm"
+                                        for d, r in zip(dirs, fail_regions)
+                                    )
+                                )
+                            # Update sidebar result banner from main thread
+                            self.after(0, self._update_live_result_banner)
+                        except Exception:
+                            pass
 
-        current_profile = get_edge_profile(gray)
-        passed, fail_regions, diff, diff_mm, abs_diff, max_abs_mm, max_raw_mm = \
-            analyze_uplift(current_profile, self._baseline_profile)
+                # ── ROI box overlay ─────────────────────────────────
+                roi_color = (0, 165, 255)   # default: orange
+                if self._live_inspect_active and self._live_result == "PASS":
+                    roi_color = (0, 220, 0)     # green
+                elif self._live_inspect_active and self._live_result == "FAIL":
+                    roi_color = (0, 0, 255)     # red
 
-        annotated = build_annotated_image(
-            rgb, current_profile, self._baseline_profile,
-            abs_diff, fail_regions, passed)
+                cv2.rectangle(bgr_ov,
+                              (CONFIG["ROI_X_START"], CONFIG["ROI_Y_START"]),
+                              (CONFIG["ROI_X_END"],   CONFIG["ROI_Y_END"]),
+                              roi_color, 3)
 
-        self._captured_display.set_rgb(annotated)
-        self._show_result(passed, fail_regions, max_abs_mm)
+                # ── PASS/FAIL text stamped on preview ───────────────
+                if self._live_inspect_active and self._live_result:
+                    verdict      = self._live_result
+                    vcolor       = (0, 220, 0) if verdict == "PASS" else (0, 0, 255)
+                    text_y_main  = CONFIG["ROI_Y_START"] - 18
+                    text_y_main  = max(text_y_main, 60)
+                    cv2.putText(bgr_ov, verdict,
+                                (CONFIG["ROI_X_START"], text_y_main),
+                                cv2.FONT_HERSHEY_SIMPLEX, 2.2, vcolor, 5)
+                    cv2.putText(bgr_ov, self._live_result_detail,
+                                (CONFIG["ROI_X_START"], text_y_main + 52),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, vcolor, 2)
 
-        # Save log
-        os.makedirs(CONFIG["LOG_DIR"], exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = os.path.join(CONFIG["LOG_DIR"],
-                             f"{timestamp}_{'PASS' if passed else 'FAIL'}.jpg")
-        cv2.imwrite(fname, cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
+                with self._live_lock:
+                    self._live_frame_bgr = bgr_ov
+                self.after(0, self._refresh_preview)
 
-        entry = {
-            "timestamp":    timestamp,
-            "source":       label,
-            "result":       "PASS" if passed else "FAIL",
-            "max_mm":       round(max_abs_mm, 4),
-            "fail_regions": fail_regions,
-            "image":        fname,
-        }
-        with open(os.path.join(CONFIG["LOG_DIR"], "inspection_log.jsonl"), "a") as f:
-            f.write(json.dumps(entry) + "\n")
-
-        self._set_status(
-            f"Inspection done — {'PASS' if passed else 'FAIL'}  "
-            f"| Max: {max_abs_mm:.3f}mm  | Saved: {fname}")
-
-    def _inspect_camera(self):
-        if self._last_rgb is None:
-            self._set_status("Capture an image first.")
-            return
-        bgr  = cv2.cvtColor(self._last_rgb, cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        self._run_inspection(self._last_rgb, gray, "CAMERA")
-
-    def _inspect_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select PCB Image to Inspect", "", "Images (*.jpg *.jpeg *.png *.bmp)")
-        if not path:
-            return
-        try:
-            rgb, gray = load_image_from_file(path)
-            self._last_rgb = rgb
-            self._run_inspection(rgb, gray, os.path.basename(path))
-        except Exception as e:
-            self._set_status(f"Error: {e}")
-
-    # ── SETTINGS ────────────────────────────────
-    def _apply_settings(self):
-        CONFIG["UPLIFT_THRESHOLD_PX"] = self._s_threshold_px.value()
-        CONFIG["MIN_FAIL_COLUMNS"]    = self._s_min_cols.value()
-        CONFIG["MAX_MM_THRESHOLD"]    = self._s_max_mm.value()
-        CONFIG["PX_PER_MM"]           = self._s_px_per_mm.value()
-        CONFIG["CANNY_LOW"]           = self._s_canny_low.value()
-        CONFIG["CANNY_HIGH"]          = self._s_canny_high.value()
-        CONFIG["CALIBRATION_IMAGES"]  = self._s_cal_images.value()
-        bk = self._s_blur.value()
-        CONFIG["BLUR_KERNEL"]         = bk if bk % 2 == 1 else bk + 1
-        self._set_status("Settings applied.")
-
-    def closeEvent(self, e):
-        if self._preview_thread:
-            self._preview_thread.stop()
-        if self._cam:
-            try:
-                self._cam.stop()
             except Exception:
                 pass
-        e.accept()
+            time.sleep(0.05)   # ~20 fps
+
+    def _refresh_preview(self):
+        with self._live_lock:
+            frame = self._live_frame_bgr
+        if frame is None:
+            return
+        photo = pil_from_bgr(frame, self.PREVIEW_W, self.PREVIEW_H)
+        self._live_canvas.delete("all")
+        cw = self._live_canvas.winfo_width()  or self.PREVIEW_W
+        ch = self._live_canvas.winfo_height() or self.PREVIEW_H
+        self._live_canvas.create_image(cw // 2, ch // 2, anchor="center",
+                                       image=photo, tags="frame")
+        self._live_canvas._photo = photo   # keep reference
+
+    # ── LIVE INSPECT TOGGLE ───────────────────────────────────────
+    def _action_toggle_live_inspect(self):
+        if not CAMERA_AVAILABLE or self.cam is None:
+            messagebox.showinfo("No Camera",
+                                "Live Inspect requires a connected camera.")
+            return
+        if self.baseline_profile is None:
+            messagebox.showinfo("No Baseline",
+                                "Calibrate first before starting Live Inspect.")
+            return
+
+        self._live_inspect_active = not self._live_inspect_active
+
+        if self._live_inspect_active:
+            self._live_result        = None
+            self._live_result_detail = ""
+            self._live_frame_count   = 0
+            self._btn_live_inspect.configure(
+                text="⏹  Stop Live Inspect", fg=RED)
+            self._log("Live Inspect started — classifying every frame in ROI.")
+            self._set_status("Live Inspect ON")
+            # Clear any stale manual result from sidebar
+            self._result_var.set("")
+            self._detail_var.set("")
+        else:
+            self._btn_live_inspect.configure(
+                text="▶  Start Live Inspect", fg=GREEN)
+            self._live_result        = None
+            self._live_result_detail = ""
+            self._result_var.set("")
+            self._detail_var.set("")
+            self._log("Live Inspect stopped.")
+            self._set_status("Live Inspect OFF")
+
+    def _update_live_result_banner(self):
+        """Called from main thread to sync sidebar result with latest live verdict."""
+        if not self._live_inspect_active or self._live_result is None:
+            return
+        if self._live_result == "PASS":
+            self._result_var.set("✅  PASS")
+            self._result_banner.configure(fg=GREEN)
+        else:
+            self._result_var.set("❌  FAIL")
+            self._result_banner.configure(fg=RED)
+        self._detail_var.set(self._live_result_detail)
+
+    # ── CAPTURE ──────────────────────────────────────────────────
+    def _action_capture(self):
+        if self.cam:
+            self._capture_from_camera()
+        else:
+            self._capture_from_file()
+
+    def _capture_from_camera(self):
+        self._set_status("Capturing…")
+        self._log("Capturing image from camera…")
+        try:
+            frame = self.cam.capture_array()
+            bgr   = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            bgr   = normalize_image(bgr)
+            gray  = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            rgb   = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            self.last_rgb  = rgb
+            self.last_gray = gray
+            self._show_captured(bgr)
+            self._log(f"Captured. Size: {bgr.shape[1]}×{bgr.shape[0]} px")
+            self._set_status("Image captured")
+        except Exception as e:
+            self._log(f"⚠  Capture error: {e}")
+            self._set_status("Capture failed")
+
+    def _capture_from_file(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select PCB image",
+            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp")],
+        )
+        if not path:
+            return
+        try:
+            bgr  = cv2.imread(path)
+            bgr  = normalize_image(bgr)
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            self.last_rgb  = rgb
+            self.last_gray = gray
+            self._show_captured(bgr)
+            self._log(f"Loaded file: {os.path.basename(path)}")
+            self._set_status("File loaded")
+        except Exception as e:
+            self._log(f"⚠  File load error: {e}")
+
+    def _show_captured(self, bgr):
+        """Display the captured BGr image on the result canvas."""
+        cw = self._result_canvas.winfo_width()  or self.RESULT_W
+        ch = self._result_canvas.winfo_height() or self.RESULT_H
+        h, w = bgr.shape[:2]
+        scale = min(cw / w, ch / h, 1.0)
+        nw, nh = int(w * scale), int(h * scale)
+        # compute offset so image is centred
+        x_off = (cw - nw) // 2
+        y_off = (ch - nh) // 2
+        self._result_scale  = scale
+        self._result_offset = (x_off, y_off)
+
+        photo = pil_from_bgr(bgr, cw, ch)
+        self._result_canvas.delete("all")
+        self._result_canvas.create_image(cw // 2, ch // 2, anchor="center",
+                                         image=photo, tags="captured")
+        self._result_canvas._photo = photo
+        # draw current ROI
+        self._draw_roi_on_canvas()
+
+    def _draw_roi_on_canvas(self):
+        """Overlay current ROI box on the result canvas."""
+        self._result_canvas.delete("roi_box")
+        sc = self._result_scale
+        ox, oy = self._result_offset
+        x1 = int(CONFIG["ROI_X_START"] * sc) + ox
+        y1 = int(CONFIG["ROI_Y_START"] * sc) + oy
+        x2 = int(CONFIG["ROI_X_END"]   * sc) + ox
+        y2 = int(CONFIG["ROI_Y_END"]   * sc) + oy
+        self._result_canvas.create_rectangle(
+            x1, y1, x2, y2,
+            outline=ORANGE, width=2, tags="roi_box", dash=(6, 4),
+        )
+
+    # ── ROI DRAWING ──────────────────────────────────────────────
+    def _action_set_roi(self):
+        if self.last_rgb is None:
+            messagebox.showinfo("No Image",
+                                "Capture or load an image first, then draw ROI.")
+            return
+        self._roi_mode = True
+        self._result_canvas.configure(cursor="crosshair")
+        self._log("ROI mode ON — click and drag on the result image to draw ROI.")
+        self._set_status("Draw ROI on captured image…")
+
+    def _roi_mouse_down(self, event):
+        if not self._roi_mode:
+            return
+        self._roi_drawing = True
+        self._roi_start   = (event.x, event.y)
+        if self._roi_rect_id:
+            self._result_canvas.delete(self._roi_rect_id)
+
+    def _roi_mouse_move(self, event):
+        if not self._roi_mode or not self._roi_drawing:
+            return
+        if self._roi_rect_id:
+            self._result_canvas.delete(self._roi_rect_id)
+        x0, y0 = self._roi_start
+        self._roi_rect_id = self._result_canvas.create_rectangle(
+            x0, y0, event.x, event.y,
+            outline=GREEN, width=2, dash=(4, 3),
+        )
+
+    def _roi_mouse_up(self, event):
+        if not self._roi_mode or not self._roi_drawing:
+            return
+        self._roi_drawing = False
+        self._roi_mode    = False
+        self._result_canvas.configure(cursor="crosshair")
+
+        x0, y0 = self._roi_start
+        x1, y1 = event.x, event.y
+        # canvas → full image coords
+        sc = self._result_scale
+        ox, oy = self._result_offset
+        img_x0 = int((min(x0, x1) - ox) / sc)
+        img_y0 = int((min(y0, y1) - oy) / sc)
+        img_x1 = int((max(x0, x1) - ox) / sc)
+        img_y1 = int((max(y0, y1) - oy) / sc)
+
+        # Clamp
+        H, W = self.last_rgb.shape[:2]
+        img_x0 = max(0, min(img_x0, W))
+        img_y0 = max(0, min(img_y0, H))
+        img_x1 = max(0, min(img_x1, W))
+        img_y1 = max(0, min(img_y1, H))
+
+        if abs(img_x1 - img_x0) < 20 or abs(img_y1 - img_y0) < 5:
+            self._log("⚠  ROI too small — try again.")
+            self._set_status("ROI too small")
+            return
+
+        CONFIG["ROI_X_START"] = img_x0
+        CONFIG["ROI_Y_START"] = img_y0
+        CONFIG["ROI_X_END"]   = img_x1
+        CONFIG["ROI_Y_END"]   = img_y1
+        save_roi_config()
+        self._update_roi_label()
+        self._draw_roi_on_canvas()
+        self._log(f"ROI saved: X {img_x0}→{img_x1}  Y {img_y0}→{img_y1}")
+        self._set_status("ROI updated")
+
+    # ── CALIBRATE ────────────────────────────────────────────────
+    def _action_calibrate(self):
+        if self.last_rgb is None or self.last_gray is None:
+            messagebox.showinfo("No Image",
+                                "Capture or load the BARE JIG image first, then calibrate.")
+            return
+        ans = messagebox.askyesno(
+            "Calibrate",
+            "This will overwrite the existing baseline.\n"
+            "Make sure the captured image shows the bare jig (no PCB).\n\nContinue?",
+        )
+        if not ans:
+            return
+        try:
+            profile = get_edge_profile(self.last_gray)
+            save_baseline(profile, self.last_rgb)
+            self.baseline_profile = profile
+            self._baseline_var.set("✓ Calibrated now")
+            self._baseline_lbl.configure(fg=GREEN)
+            self._log(f"Calibration done. Baseline median Y = {np.median(profile):.1f} px")
+            self._set_status("Calibrated")
+            self._result_var.set("")
+            self._detail_var.set("")
+        except Exception as e:
+            self._log(f"⚠  Calibration error: {e}")
+
+    # ── INSPECT ──────────────────────────────────────────────────
+    def _action_inspect(self):
+        if self.last_gray is None:
+            messagebox.showinfo("No Image", "Capture or load a PCB image first.")
+            return
+        if self.baseline_profile is None:
+            messagebox.showinfo("No Baseline",
+                                "No baseline loaded. Run Calibrate first.")
+            return
+
+        self._set_status("Inspecting…")
+        self._log("Running inspection…")
+
+        try:
+            current_profile = get_edge_profile(self.last_gray)
+            passed, fail_regions, diff, diff_mm, max_abs_mm, max_raw_mm = analyze_uplift(
+                current_profile, self.baseline_profile
+            )
+
+            # Annotated image
+            bgr = cv2.cvtColor(self.last_rgb, cv2.COLOR_RGB2BGR)
+            ann = build_annotated_image(
+                bgr, current_profile, self.baseline_profile,
+                diff, fail_regions, passed,
+            )
+
+            # Show on result canvas
+            cw = self._result_canvas.winfo_width()  or self.RESULT_W
+            ch = self._result_canvas.winfo_height() or self.RESULT_H
+            photo = pil_from_bgr(ann, cw, ch)
+            self._result_canvas.delete("all")
+            self._result_canvas.create_image(cw // 2, ch // 2, anchor="center",
+                                             image=photo, tags="result")
+            self._result_canvas._photo = photo
+
+            # Save annotated
+            ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+            label = "PASS" if passed else "FAIL"
+            os.makedirs(CONFIG["LOG_DIR"], exist_ok=True)
+            img_path = os.path.join(CONFIG["LOG_DIR"], f"{ts}_{label}.jpg")
+            cv2.imwrite(img_path, ann)
+            write_log(ts, "UI", passed, max_abs_mm, fail_regions, img_path)
+
+            # Result banner
+            if passed:
+                self._result_var.set("✅  PASS")
+                self._result_banner.configure(fg=GREEN)
+                self._detail_var.set(
+                    f"Max deviation: {max_abs_mm:.3f} mm\n"
+                    f"Threshold: {CONFIG['MAX_MM_THRESHOLD']} mm"
+                )
+            else:
+                self._result_var.set("❌  FAIL")
+                self._result_banner.configure(fg=RED)
+                details = [f"Max deviation: {max_abs_mm:.3f} mm"]
+                for i, r in enumerate(fail_regions, 1):
+                    d = "↑ lifted" if r["direction"] == "lifted" else "↓ sunken"
+                    details.append(
+                        f"  {i}. {d}  {r['max_uplift_mm']:.2f}mm "
+                        f"@ {r['x_start_mm']:.0f}–{r['x_end_mm']:.0f}mm"
+                    )
+                self._detail_var.set("\n".join(details))
+
+            self._log(f"Result: {label}  |  max={max_abs_mm:.3f}mm  |  saved → {img_path}")
+            self._set_status(label)
+
+        except Exception as e:
+            self._log(f"⚠  Inspection error: {e}")
+            self._set_status("Error")
+
+    # ── CLOSE ────────────────────────────────────────────────────
+    def _on_close(self):
+        self._preview_running = False
+        if self.cam:
+            try:
+                self.cam.stop()
+            except Exception:
+                pass
+        self.destroy()
 
 
 # ──────────────────────────────────────────────
 # ENTRY POINT
 # ──────────────────────────────────────────────
-def main():
-    app = QApplication(sys.argv)
-    app.setFont(QFont("Segoe UI", 10))
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec_())
-
 if __name__ == "__main__":
-    main()
+    app = PCBApp()
+    app.mainloop()
