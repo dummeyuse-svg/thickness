@@ -146,3 +146,124 @@ def run_calibration(cam=None):
 
 pip show PyQt5 2>/dev/null | head -3; python3 -c "import PyQt5" 2>&1 | head -3
 
+
+
+
+
+steps to do offline setup (5-4-2026)
+🥇 Step 1: Install Python (if not already)
+
+On your work laptop:
+
+python --version
+If it works → ✅ skip
+If not → install Python (offline installer if needed)
+🥈 Step 2: Extract your project
+
+Unzip your folder somewhere like:
+
+Desktop/mttr_project/
+
+Inside it should have:
+
+app.py
+clean_excel.py
+index.html
+offline-packages/
+chroma_db/ (if already created)
+requirements.txt (if you made it)
+🥉 Step 3: Create virtual environment (VERY IMPORTANT)
+
+Inside that folder:
+
+python -m venv venv
+
+Activate it:
+
+venv\Scripts\activate
+🏗️ Step 4: Install dependencies (OFFLINE)
+
+Assuming your folder is offline-packages/:
+
+pip install --no-index --find-links=offline-packages -r requirements.txt
+
+👉 If no requirements.txt:
+
+pip install --no-index --find-links=offline-packages *
+🤖 Step 5: Install Ollama
+
+Run your Ollama setup file:
+
+Install normally
+Finish installation
+🧠 Step 6: Add your model (IMPORTANT)
+
+You said you already have the model — good.
+
+Option A (BEST – if your model folder exists)
+
+Copy this from your personal laptop:
+
+C:\Users\<your-user>\.ollama
+
+Paste into work laptop:
+
+C:\Users\<work-user>\.ollama
+Then verify:
+ollama list
+
+👉 You should see:
+
+phi3
+or
+phi3:mini
+⚡ Step 7: Start Ollama
+ollama run phi3
+
+👉 Keep this terminal open
+
+🧪 Step 8: Run your backend
+
+In another terminal:
+
+uvicorn app:app --host 127.0.0.1 --port 8000
+🌐 Step 9: Open frontend
+
+Open:
+
+index.html
+
+OR go to:
+
+http://127.0.0.1:8000/docs
+🚨 Common failure points (read this carefully)
+❌ Problem 1: ModuleNotFoundError
+
+👉 Fix:
+
+pip install --no-index --find-links=offline-packages <missing-package>
+❌ Problem 2: Ollama timeout (you already saw this)
+
+👉 Fix:
+
+Make sure:
+ollama run phi3
+
+is running
+
+❌ Problem 3: model not found
+
+👉 Fix:
+
+ollama list
+
+If empty → model copy failed
+
+❌ Problem 4: ChromaDB not working
+
+👉 Ensure:
+
+chroma_db/
+
+folder is in same directory
+
